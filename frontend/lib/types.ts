@@ -77,6 +77,8 @@ export interface RepairStrategy {
   prior_success_rate: number;
   safety_score: number;
   selected: boolean;
+  fixed_code?: string;
+  explanation?: string;
   evidence: string[];
 }
 

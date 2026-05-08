@@ -15,19 +15,35 @@ export interface SessionContext {
 }
 
 function clerkEnabled() {
-  return Boolean(
-    process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY && process.env.CLERK_SECRET_KEY
-  );
+  // If explicitly disabled or if we are in a dev environment without full keys
+  if (process.env.AUTH_DEV_MODE === "true") return false;
+  
+  const hasKeys = !!(process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY && process.env.CLERK_SECRET_KEY);
+  return hasKeys;
 }
 
 export async function getSessionContext(): Promise<SessionContext> {
+  // CRITICAL: Bypass Clerk entirely if in Dev Mode
+  // This prevents slow timeouts and crashes when Clerk is unreachable
+  if (process.env.AUTH_DEV_MODE === "true" || process.env.NODE_ENV === "development") {
+    console.log("🛠️ Running in AUTH_DEV_MODE: Bypassing Clerk");
+    return {
+      userId: "dev-admin",
+      role: "admin",
+      clerkEnabled: false,
+      signedIn: true,
+      email: "admin@local",
+      token: null
+    };
+  }
+
   if (!clerkEnabled()) {
     return {
       clerkEnabled: false,
       signedIn: true,
-      userId: "dev-operator",
+      userId: "dev-admin",
       role: "admin",
-      email: "dev@local",
+      email: "admin@local",
       token: null
     };
   }

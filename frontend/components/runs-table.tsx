@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
+import { Download, FileText } from "lucide-react";
 
 import { StatusPill } from "@/components/status-pill";
 import type { QARunRecord } from "@/lib/types";
@@ -54,6 +55,7 @@ export function RunsTable({ runs }: { runs: QARunRecord[] }) {
             <th>Retries</th>
             <th>Scores</th>
             <th>Updated</th>
+            <th>Reports</th>
           </tr>
         </thead>
         <tbody>
@@ -78,7 +80,40 @@ export function RunsTable({ runs }: { runs: QARunRecord[] }) {
                 <br />
                 <small>Validation {run.scores.validation}</small>
               </td>
-              <td>{new Date(run.updated_at).toLocaleString()}</td>
+              <td>
+                <span suppressHydrationWarning>
+                  {new Date(run.updated_at).toLocaleString()}
+                </span>
+              </td>
+              <td>
+                <div style={{ display: "flex", gap: 8 }}>
+                  {run.latest_state.report_pdf_path && (
+                    <a
+                      href={`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/storage/${run.latest_state.report_pdf_path}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title="Download PDF"
+                      className="muted-link"
+                    >
+                      <Download size={16} />
+                    </a>
+                  )}
+                  {(run.latest_state.report_md_url || run.latest_state.report_markdown) && (
+                    <a
+                      href={
+                        (run.latest_state.report_md_url as string) ||
+                        `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/storage/uploads/${run.id}/report.md`
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title="Download MD"
+                      className="muted-link"
+                    >
+                      <FileText size={16} />
+                    </a>
+                  )}
+                </div>
+              </td>
             </tr>
           ))}
         </tbody>

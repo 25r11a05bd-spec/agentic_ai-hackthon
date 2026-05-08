@@ -78,6 +78,44 @@ async def get_qa_run(
     return {"success": True, "data": run.model_dump(mode="json")}
 
 
+@router.get("/{run_id}/download-report")
+async def download_run_report(
+    run_id: str,
+    repository: FileRunRepository = Depends(get_repository),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    from fastapi.responses import Response
+    from app.core.config import get_settings
+
+    del user
+    run = await repository.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
+
+    # 1. Try report_markdown stored in database
+    if run.report_markdown:
+        return Response(
+            content=run.report_markdown.encode("utf-8"),
+            media_type="text/markdown",
+            headers={"Content-Disposition": f'attachment; filename="result_{run_id}.md"'},
+        )
+
+    # 2. Try local file on disk
+    settings = get_settings()
+    local_path = settings.data_dir / "uploads" / run_id / "report.md"
+    if local_path.exists():
+        return Response(
+            content=local_path.read_bytes(),
+            media_type="text/markdown",
+            headers={"Content-Disposition": f'attachment; filename="result_{run_id}.md"'},
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Report not generated yet. Please wait for the run to complete.",
+    )
+
+
 @router.get("/{run_id}/graph")
 async def get_qa_run_graph(
     run_id: str,

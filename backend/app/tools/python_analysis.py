@@ -1,78 +1,147 @@
-from __future__ import annotations
-
 import ast
+import builtins
+from typing import Set
 
 from app.schemas.qa_run import PythonAnalysis, QualityReportSummary, QualityScores, WorkflowFinding
 from app.utils.time import utcnow
 
-
 HTTP_CLIENT_IMPORTS = {"requests", "httpx", "aiohttp"}
+UNSAFE_CALLS = {"exec", "eval", "os.system", "subprocess.run", "subprocess.Popen"}
 
+class SecurityVisitor(ast.NodeVisitor):
+    def __init__(self):
+        # Pass 1: Track all defined symbols (built-ins + assignments + imports)
+        self.defined_names: Set[str] = set(dir(builtins))
+        self.defined_names.update({"app", "FastAPI", "self", "cls", "args", "kwargs", "MEMORY"})
+        self.used_names: Set[str] = set()
+        self.findings: list[str] = []
+        self.api_calls: list[str] = []
+        self.validators: list[str] = []
+        self.functions: list[str] = []
+        self.classes: list[str] = []
+        self.imports: list[str] = []
+
+    def _add_target(self, node):
+        """Recursively add assignment targets to defined names."""
+        if isinstance(node, ast.Name):
+            self.defined_names.add(node.id)
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            for elt in node.elts:
+                self._add_target(elt)
+        elif isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name):
+                self.defined_names.add(node.value.id)
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            self.imports.append(alias.name)
+            self.defined_names.add(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        if node.module:
+            self.imports.append(node.module)
+            for alias in node.names:
+                self.defined_names.add(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        self.functions.append(node.name)
+        self.defined_names.add(node.name)
+        # Add arguments
+        for arg in node.args.args:
+            self.defined_names.add(arg.arg)
+        if node.args.vararg: self.defined_names.add(node.args.vararg.arg)
+        if node.args.kwarg: self.defined_names.add(node.args.kwarg.arg)
+        
+        # Pre-scan function body for any assignments to avoid false-positives
+        for sub_node in ast.walk(node):
+            if isinstance(sub_node, (ast.Assign, ast.AnnAssign)):
+                targets = sub_node.targets if hasattr(sub_node, "targets") else [sub_node.target]
+                for t in targets: self._add_target(t)
+            elif isinstance(sub_node, (ast.For, ast.AsyncFor)):
+                self._add_target(sub_node.target)
+            elif isinstance(sub_node, (ast.With, ast.AsyncWith)):
+                for item in sub_node.items:
+                    if item.optional_vars: self._add_target(item.optional_vars)
+        
+        if node.name.startswith(("validate_", "check_", "guard_")):
+            self.validators.append(node.name)
+        self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self.visit_FunctionDef(node)
+
+    def visit_Assign(self, node):
+        for t in node.targets: self._add_target(t)
+        self.generic_visit(node)
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load):
+            self.used_names.add(node.id)
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        func_name = ""
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            func_name = f"{getattr(node.func.value, 'id', '')}.{node.func.attr}"
+
+        if func_name in UNSAFE_CALLS:
+            self.findings.append(f"CRITICAL SECURITY RISK: Unsafe call detected: {func_name}")
+
+        if func_name == "open" and node.args:
+            first_arg = node.args[0]
+            if isinstance(first_arg, ast.Name):
+                self.findings.append(f"HIGH SECURITY RISK: Potential Path Traversal in 'open()' with dynamic variable '{first_arg.id}'")
+
+        if isinstance(node.func, ast.Attribute):
+            owner = getattr(node.func.value, "id", "")
+            if owner in {"requests", "httpx", "client", "session"} and node.func.attr in {"get", "post", "put", "delete"}:
+                self.api_calls.append(node.func.attr)
+
+        self.generic_visit(node)
 
 def analyze_python_code(source: str) -> PythonAnalysis:
-    tree = ast.parse(source)
+    try:
+        # Initial pass to define all names
+        tree = ast.parse(source)
+        visitor = SecurityVisitor()
+        
+        # Double-scan the whole tree first for globals and functions
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if hasattr(node, "targets") else [node.target]
+                for t in targets: visitor._add_target(t)
+            elif isinstance(node, ast.ClassDef):
+                visitor.defined_names.add(node.name)
+            elif isinstance(node, (ast.For, ast.With)):
+                # Handle top-level loops/withs
+                pass 
 
-    imports: list[str] = []
-    functions: list[str] = []
-    classes: list[str] = []
-    api_calls: list[str] = []
-    validators: list[str] = []
-    retry_patterns: list[str] = []
-    exception_handlers: list[str] = []
-    risk_flags: list[str] = []
+        visitor.visit(tree)
+    except SyntaxError as e:
+        return PythonAnalysis(risk_flags=[f"Syntax Error: {e.msg} at line {e.lineno}"], ast_summary="Failed to parse Python code.")
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imports.extend(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imports.append(node.module)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            functions.append(node.name)
-            if node.name.startswith(("validate_", "check_", "guard_")):
-                validators.append(node.name)
-        elif isinstance(node, ast.ClassDef):
-            classes.append(node.name)
-        elif isinstance(node, ast.Try):
-            exception_handlers.append("try/except")
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            owner = getattr(node.func.value, "id", "")
-            if owner in {"requests", "httpx", "client", "session"} and node.func.attr in {
-                "get",
-                "post",
-                "put",
-                "patch",
-                "delete",
-                "head",
-                "options",
-            }:
-                api_calls.append(node.func.attr)
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in {"retry", "sleep"}:
-                retry_patterns.append(node.func.id)
-
-    if not validators:
-        risk_flags.append("No explicit validation functions were found in app.py.")
-    if not retry_patterns:
-        risk_flags.append("No retry or backoff helper was found in app.py.")
-    if not any(entry.split(".", 1)[0] in HTTP_CLIENT_IMPORTS for entry in imports):
-        risk_flags.append("No HTTP client library import was detected; API validation may be indirect.")
+    # Detect Undefined Symbols
+    undefined = visitor.used_names - visitor.defined_names
+    for name in undefined:
+        if not name.startswith("__") and name.isidentifier():
+            visitor.findings.append(f"Undefined variable or function reference: '{name}'")
 
     return PythonAnalysis(
-        imports=sorted(set(imports)),
-        functions=sorted(set(functions)),
-        classes=sorted(set(classes)),
-        api_calls=sorted(set(api_calls)),
-        validators=sorted(set(validators)),
-        retry_patterns=sorted(set(retry_patterns)),
-        exception_handlers=exception_handlers,
-        risk_flags=risk_flags,
+        imports=sorted(set(visitor.imports)),
+        functions=sorted(set(visitor.functions)),
+        classes=sorted(set(visitor.classes)),
+        api_calls=sorted(set(visitor.api_calls)),
+        validators=sorted(set(visitor.validators)),
+        risk_flags=visitor.findings,
         ast_summary=(
-            f"Detected {len(functions)} functions, {len(classes)} classes, "
-            f"{len(api_calls)} HTTP call sites, and {len(validators)} validator-style functions."
+            f"Detected {len(visitor.functions)} functions, {len(visitor.classes)} classes, "
+            f"and {len(visitor.findings)} critical code risks."
         ),
     )
-
 
 def generate_quality_report(
     run_id: str,

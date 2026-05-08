@@ -34,6 +34,8 @@ from app.services.reporting import generate_markdown_report, generate_pdf_report
 from app.tools.api_validation import inspect_response, retry_request
 from app.tools.python_analysis import analyze_python_code, generate_quality_report
 from app.tools.workflow_validation import detect_hallucinations, inspect_workflow, normalize_workflow, validate_json
+from app.tools.sandbox import run_in_sandbox, analyze_sandbox_result
+from app.tools.ai_agent import generate_ai_reflection, generate_repair_strategies
 from app.utils.time import utcnow
 from app.workflows.runtime import EXECUTION_NODE_IDS, build_execution_graph
 
@@ -46,12 +48,14 @@ class QARunService:
         notification_service: NotificationService,
         websocket_manager: PlaybackWebSocketManager,
         settings: Settings,
+        supabase_storage: SupabaseStorageService | None = None,
     ) -> None:
         self._repository = repository
         self._memory_service = memory_service
         self._notification_service = notification_service
         self._websocket_manager = websocket_manager
         self._settings = settings
+        self._supabase_storage = supabase_storage
         self._processing: dict[str, asyncio.Task[None]] = {}
 
     async def create_run(
@@ -71,6 +75,21 @@ class QARunService:
         workflow_path = run_dir / workflow_file_name
         project_path.write_bytes(project_bytes)
         workflow_path.write_bytes(workflow_bytes)
+
+        if self._supabase_storage and self._supabase_storage.is_enabled:
+            try:
+                await self._supabase_storage.upload_file(
+                    self._settings.supabase_storage_bucket_uploads,
+                    f"{run_id}/{project_file_name}",
+                    project_bytes
+                )
+                await self._supabase_storage.upload_file(
+                    self._settings.supabase_storage_bucket_uploads,
+                    f"{run_id}/{workflow_file_name}",
+                    workflow_bytes
+                )
+            except Exception:
+                pass # Fallback to local
 
         stored_attachments: list[RunArtifact] = []
         for attachment_name, payload in attachments or []:
@@ -144,13 +163,28 @@ class QARunService:
         await self._transition_node(run_id, "planner", node_status_map)
         python_analysis = analyze_python_code(source)
         workflow = normalize_workflow(raw_workflow)
+        
+        # Create findings from Python Static Analysis risks
+        static_findings = [
+            WorkflowFinding(
+                category="static_analysis",
+                severity="high" if any(x in risk.lower() for x in ["unsafe", "undefined", "traversal", "recursion"]) else "medium",
+                title=risk,
+                description="Detected during static analysis of app.py.",
+                recommendation="Review the code for security vulnerabilities or logical errors."
+            )
+            for risk in python_analysis.risk_flags
+        ]
+        
+        await self._repository.replace_findings(run_id, static_findings)
+
         await self._emit(
             run_id,
             "agent_log",
             "planner",
-            "Normalized workflow and extracted Python symbols",
+            "Normalized workflow and performed static analysis",
             "success",
-            payload={"ast_summary": python_analysis.ast_summary, "node_count": len(workflow.nodes)},
+            payload={"ast_summary": python_analysis.ast_summary, "node_count": len(workflow.nodes), "risks_found": len(static_findings)},
         )
         collaboration.append(
             self._collaboration_step(
@@ -186,7 +220,13 @@ class QARunService:
         )
 
         await self._transition_node(run_id, "executor", node_status_map)
-        findings = inspect_workflow(raw_workflow, workflow)
+        findings = list(static_findings) # Carry forward static analysis findings
+        
+        # Runtime Sandbox Execution
+        sandbox_result = await run_in_sandbox(source)
+        findings.extend(analyze_sandbox_result(sandbox_result))
+        
+        findings.extend(inspect_workflow(raw_workflow, workflow))
         findings.extend(
             detect_hallucinations(
                 workflow=workflow,
@@ -225,12 +265,19 @@ class QARunService:
         await self._repository.replace_findings(run_id, findings)
         await self._transition_node(run_id, "validator", node_status_map)
         scores = self._score_with_context(findings)
-        risk_level = self._risk_level(scores.hallucination_risk, scores.validation)
+        risk_level = self._risk_level(scores, findings)
         quality_summary = generate_quality_report(run_id, "running", scores, findings)
-        validation_passed = scores.validation >= self._settings.approval_validation_threshold and scores.hallucination_risk <= self._settings.approval_hallucination_threshold
+        
+        # Enforce strict validation
+        validation_passed = (
+            scores.validation >= self._settings.approval_validation_threshold 
+            and scores.hallucination_risk <= self._settings.approval_hallucination_threshold
+            and not any(f.severity in {"critical", "high"} for f in findings)
+        )
+        
         await self._repository.update_run(
             run_id,
-            scores=scores,
+            scores=scores.model_dump(mode="json"),
             risk_level=risk_level,
             latest_state={
                 "python_analysis": python_analysis.model_dump(mode="json"),
@@ -255,11 +302,18 @@ class QARunService:
         failure_explanation: FailureExplanation | None = None
         repair_strategies: list[RepairStrategy] = []
         approval_needed = False
-        status = "success"
+        
+        # FIX: Default to failed if validation fails
+        status = "success" if validation_passed else "failed"
 
         await self._transition_node(run_id, "failure_explainer", node_status_map)
         if findings:
-            failure_explanation = self._build_failure_explanation(findings, python_analysis.ast_summary, api_results, run.retries_used)
+            # AI Agent Reflection
+            ai_explanation = await generate_ai_reflection(source, findings, sandbox_result.get("stderr", ""))
+            if ai_explanation:
+                failure_explanation = ai_explanation
+            else:
+                failure_explanation = self._build_failure_explanation(findings, python_analysis.ast_summary, api_results, run.retries_used)
             await self._repository.save_failure_explanation(run_id, failure_explanation)
             await self._emit(
                 run_id,
@@ -304,18 +358,32 @@ class QARunService:
 
         await self._transition_node(run_id, "self_heal_router", node_status_map)
         if not validation_passed:
-            memory_hits = await retrieve_memory(
-                self._memory_service,
-                "failure_patterns",
-                failure_explanation.root_cause if failure_explanation else "unknown failure",
-                limit=self._settings.self_heal_max_strategies,
-            )
-            repair_strategies = rank_repair_strategies(
-                candidates=self._build_repair_strategies(findings, workflow.api_calls),
-                retrieved_memories=memory_hits,
-                min_similarity=self._settings.self_heal_min_similarity,
-                max_strategies=self._settings.self_heal_max_strategies,
-            )
+            # MEMORY RETRIEVAL: Find past successful fixes for this failure
+            past_memories = []
+            memory_hits = []
+            if failure_explanation:
+                memory_hits = await retrieve_memory(
+                    self._memory_service,
+                    "failure_patterns",
+                    failure_explanation.root_cause,
+                    limit=3
+                )
+                past_memories = [m["text"] for m in memory_hits]
+                await self._emit(run_id, "agent_log", "self_heal_router", f"Retrieved {len(past_memories)} past repair memories", "success")
+
+            # AI Agent Repair Patch Generation (Informed by Memory)
+            ai_strategies = await generate_repair_strategies(source, findings, past_memories)
+            
+            if ai_strategies:
+                repair_strategies = ai_strategies
+            else:
+                # Fallback to ranked pattern matching if AI fails
+                repair_strategies = rank_repair_strategies(
+                    candidates=self._build_repair_strategies(findings, workflow.api_calls),
+                    retrieved_memories=memory_hits,
+                    min_similarity=self._settings.self_heal_min_similarity,
+                    max_strategies=self._settings.self_heal_max_strategies,
+                )
             await self._repository.save_repair_strategies(run_id, repair_strategies)
             for strategy in repair_strategies:
                 await self._emit(
@@ -332,44 +400,57 @@ class QARunService:
         if not validation_passed and run.retry_enabled and run.retries_used < run.max_retries:
             retries_used = run.retries_used + 1
             selected = repair_strategies[0] if repair_strategies else None
-            if selected:
+            
+            if selected and selected.fixed_code:
+                # Apply REAL patch to the app.py attachment
+                updated_attachments = []
+                for attr in run.attachments:
+                    if attr.name == "app.py":
+                        attr.content = selected.fixed_code
+                    updated_attachments.append(attr.model_dump())
+                
+                await self._repository.update_run(run_id, {"attachments": updated_attachments})
+                
                 selected.selected = True
-                approval_needed = True
                 await self._repository.save_repair_strategies(run_id, repair_strategies)
                 await self._emit(
                     run_id,
                     "self_heal_applied",
                     "retry_or_replan",
-                    selected.title,
-                    "running",
+                    f"Applying Real Patch: {selected.title}",
+                    "success",
                     payload=selected.model_dump(mode="json"),
                 )
+
             await self._emit(
                 run_id,
                 "retry_scheduled",
                 "retry_or_replan",
-                f"Retry #{retries_used} scheduled with safe execution plan changes",
+                f"Retry #{retries_used} starting on patched source code...",
                 "running",
             )
             await self._repository.update_run(
                 run_id,
-                retries_used=retries_used,
-                latest_state={
-                    "self_heal_changed_path": bool(selected),
-                    "selected_repair_strategy": selected.model_dump(mode="json") if selected else None,
-                },
+                {
+                    "retries_used": retries_used,
+                    "status": "running",
+                    "current_agent": "planner"
+                }
             )
-            validation_passed = bool(selected) and all(item.severity not in {"critical", "high"} for item in findings)
+            return # Exit current orchestration to let the retry loop take over
 
         await self._transition_node(run_id, "approval_gate", node_status_map)
         current_run = await self._require_run(run_id)
         if (
-            scores.validation < self._settings.approval_validation_threshold
+            not validation_passed
+            or scores.validation < self._settings.approval_validation_threshold
             or scores.hallucination_risk > self._settings.approval_hallucination_threshold
             or current_run.retries_used >= current_run.max_retries
             or approval_needed
         ):
-            status = "approval_required"
+            # If it failed but no self-heal worked, mark as approval required or failed
+            status = "approval_required" if (approval_needed or not validation_passed) else "failed"
+            
             approval = ApprovalRecord(
                 run_id=run_id,
                 status="pending",
@@ -386,8 +467,6 @@ class QARunService:
                 "pending",
                 payload=approval.model_dump(mode="json"),
             )
-        elif not validation_passed:
-            status = "failed"
 
         await self._transition_node(run_id, "memory_writer", node_status_map)
         await self._write_memories(run_id, workflow, findings, failure_explanation, repair_strategies)
@@ -431,12 +510,46 @@ class QARunService:
         detail = await self._require_run(run_id)
         refreshed_summary = generate_quality_report(run_id, status, scores, findings)
         markdown = generate_markdown_report(detail, refreshed_summary, failure_explanation)
-        pdf_path = generate_pdf_report(markdown, self._settings.data_dir / "reports" / f"{run_id}.pdf")
-        # Save physical markdown report for easy access
+        pdf_rel_path = f"reports/{run_id}.pdf"
+        pdf_path = generate_pdf_report(markdown, self._settings.data_dir / pdf_rel_path)
+
+        if self._supabase_storage and self._supabase_storage.is_enabled:
+            try:
+                with open(pdf_path, "rb") as f:
+                    cloud_url = await self._supabase_storage.upload_file(
+                        self._settings.supabase_storage_bucket_reports,
+                        f"{run_id}.pdf",
+                        f.read(),
+                        "application/pdf"
+                    )
+                    pdf_rel_path = cloud_url # Use cloud URL instead of local path
+            except Exception:
+                pass
+        
+        # Save physical markdown report
         report_md_path = Path(detail.latest_state["upload_dir"]) / "report.md"
         report_md_path.write_text(markdown, encoding="utf-8")
         
-        await self._repository.save_report(run_id, markdown, pdf_path)
+        report_md_url = None
+        if self._supabase_storage and self._supabase_storage.is_enabled:
+            try:
+                report_md_url = await self._supabase_storage.upload_file(
+                    self._settings.supabase_storage_bucket_reports,
+                    f"{run_id}.md",
+                    markdown.encode("utf-8"),
+                    "text/markdown"
+                )
+            except Exception:
+                pass
+
+        await self._repository.save_report(run_id, markdown, pdf_rel_path)
+        await self._repository.update_run(
+            run_id,
+            latest_state={
+                **detail.latest_state,
+                "report_md_url": report_md_url
+            }
+        )
         await self._repository.save_collaboration(run_id, collaboration)
         node_status_map["finalizer"] = "completed"
         await self._repository.update_run(
@@ -633,11 +746,19 @@ class QARunService:
 
         return score_workflow_quality(findings)
 
-    def _risk_level(self, hallucination_risk: int, validation_score: int) -> str:
-        if hallucination_risk > 50 or validation_score < 70:
+    def _risk_level(self, scores, findings: list[WorkflowFinding]) -> str:
+        # Priority 1: Critical or High severity findings always mean High Risk
+        if any(f.severity == "critical" for f in findings):
             return "high"
-        if hallucination_risk > 20 or validation_score < 85:
+        if any(f.severity == "high" for f in findings):
+            return "high"
+        
+        # Priority 2: Score-based risk
+        if scores.hallucination_risk > 50 or scores.validation < 60:
+            return "high"
+        if scores.hallucination_risk > 20 or scores.validation < 80 or any(f.severity == "medium" for f in findings):
             return "medium"
+            
         return "low"
 
     def _build_failure_explanation(

@@ -20,21 +20,31 @@ export function RunActionPanel({ runId, role, status }: RunActionPanelProps) {
   const canApprove = role === "admin" && status === "approval_required";
   const canRetry = role === "admin" || role === "operator";
 
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
   const send = (path: string, payload: Record<string, string>) => {
     startTransition(async () => {
       setMessage(null);
-      const response = await fetch(path, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      const result = (await response.json()) as { success?: boolean; detail?: string };
-      if (!response.ok) {
-        setMessage(result.detail ?? "Action failed.");
-        return;
+      try {
+        const response = await fetch(`${API_BASE}${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        
+        const result = (await response.json()) as { success?: boolean; detail?: string };
+        
+        if (!response.ok) {
+          setMessage(result.detail ?? "Action failed.");
+          return;
+        }
+        
+        setMessage("Action completed.");
+        router.refresh();
+      } catch (err) {
+        console.error("Fetch error:", err);
+        setMessage("Connection failed. Is the backend (port 8000) running?");
       }
-      setMessage("Action completed.");
-      router.refresh();
     });
   };
 
@@ -51,7 +61,7 @@ export function RunActionPanel({ runId, role, status }: RunActionPanelProps) {
           className="toolbar-select"
           disabled={!canRetry || isPending}
           onClick={() =>
-            send(`/api/qa-runs/${runId}/retry`, {
+            send(`/api/v1/qa-runs/${runId}/retry`, {
               reason: "Manual retry triggered from frontend control panel."
             })
           }
@@ -63,7 +73,7 @@ export function RunActionPanel({ runId, role, status }: RunActionPanelProps) {
           className="toolbar-select"
           disabled={!canApprove || isPending}
           onClick={() =>
-            send(`/api/qa-runs/${runId}/approve`, {
+            send(`/api/v1/qa-runs/${runId}/approve`, {
               decision: "approved",
               rationale: "Approved from frontend control panel."
             })
@@ -76,7 +86,7 @@ export function RunActionPanel({ runId, role, status }: RunActionPanelProps) {
           className="toolbar-select"
           disabled={!canApprove || isPending}
           onClick={() =>
-            send(`/api/qa-runs/${runId}/approve`, {
+            send(`/api/v1/qa-runs/${runId}/approve`, {
               decision: "rejected",
               rationale: "Rejected from frontend control panel."
             })

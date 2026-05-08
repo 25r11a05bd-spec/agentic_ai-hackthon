@@ -121,6 +121,8 @@ class RepairStrategy(BaseModel):
     prior_success_rate: float = 0.0
     safety_score: float = 1.0
     selected: bool = False
+    fixed_code: str | None = None
+    explanation: str | None = None
     evidence: list[str] = Field(default_factory=list)
 
 

@@ -18,6 +18,11 @@
   box-sizing: border-box;
 }
 
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: translateY(-50%) scale(1); }
+  50%       { opacity: 0.4; transform: translateY(-50%) scale(1.5); }
+}
+
 html {
   min-height: 100%;
   background:
@@ -150,7 +155,11 @@ select {
 .detail-grid,
 .history-grid,
 .settings-grid,
-.filter-row,
+.filter-row {
+  display: grid;
+  gap: 16px;
+}
+
 .artifact-list,
 .approval-list,
 .lane-list,
@@ -158,6 +167,32 @@ select {
 .timeline-list {
   display: grid;
   gap: 16px;
+  max-height: 480px;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+/* Futuristic Scrollbar */
+.finding-list::-webkit-scrollbar,
+.timeline-list::-webkit-scrollbar,
+.lane-list::-webkit-scrollbar,
+.console-stream::-webkit-scrollbar {
+  width: 6px;
+}
+
+.finding-list::-webkit-scrollbar-thumb,
+.timeline-list::-webkit-scrollbar-thumb,
+.lane-list::-webkit-scrollbar-thumb,
+.console-stream::-webkit-scrollbar-thumb {
+  background: rgba(42, 228, 255, 0.2);
+  border-radius: 10px;
+}
+
+.finding-list::-webkit-scrollbar-thumb:hover,
+.timeline-list::-webkit-scrollbar-thumb:hover,
+.lane-list::-webkit-scrollbar-thumb:hover,
+.console-stream::-webkit-scrollbar-thumb:hover {
+  background: rgba(42, 228, 255, 0.5);
 }
 
 .badge-row {

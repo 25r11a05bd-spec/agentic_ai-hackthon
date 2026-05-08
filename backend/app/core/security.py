@@ -57,9 +57,9 @@ async def get_current_user(
 ) -> AuthenticatedUser:
     settings = get_settings()
 
-    if settings.auth_dev_mode and not authorization:
+    if settings.auth_dev_mode:
         return AuthenticatedUser(
-            user_id=x_demo_user or "dev-operator",
+            user_id=x_demo_user or "dev-admin",
             role=(x_demo_role or "admin"),  # type: ignore[arg-type]
             email="dev@local",
         )
@@ -67,7 +67,8 @@ async def get_current_user(
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token.")
 
-    payload = await _decode_clerk_token(authorization.split(" ", 1)[1])
+    token = authorization.split(" ", 1)[1]
+    payload = await _decode_clerk_token(token)
     public_metadata = payload.get("public_metadata", {})
     role = public_metadata.get("role", "viewer")
     return AuthenticatedUser(

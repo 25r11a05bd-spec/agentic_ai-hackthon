@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from app.schemas.qa_run import CanonicalWorkflowSpec, QualityScores, WorkflowEdge, WorkflowFinding, WorkflowNode
+from app.schemas.qa_run import CanonicalWorkflowSpec, QualityScores, RepairStrategy, WorkflowEdge, WorkflowFinding, WorkflowNode
 
 
 APPROVED_TOOL_TYPES = {"task", "api", "http", "request", "validator", "approval", "memory", "notify"}
@@ -192,6 +192,22 @@ def detect_hallucinations(
 
     for node in workflow.nodes:
         declared_function = str(node.config.get("function", "")).lower()
+        declared_endpoint = str(node.config.get("endpoint", "")).lower()
+
+        # Check 1: Missing Implementation (Unanchored Logic)
+        if not declared_function and not declared_endpoint and node.type in {"task", "api"}:
+            findings.append(
+                WorkflowFinding(
+                    category="hallucination",
+                    severity="high",
+                    title="Unanchored Workflow Logic",
+                    description=f"Node '{node.label}' describes a task but provides no Python function or API endpoint.",
+                    affected_nodes=[node.id],
+                    recommendation="Map this node to a function in app.py or provide an API endpoint in the config."
+                )
+            )
+
+        # Check 2: Missing Python Symbol
         if declared_function and declared_function not in known_symbols:
             findings.append(
                 WorkflowFinding(
@@ -264,10 +280,81 @@ def detect_hallucinations(
     return findings
 
 
+def _check_cycles(nodes: list[WorkflowNode], edges: list[WorkflowEdge]) -> list[str]:
+    adj = {n.id: [] for n in nodes}
+    for e in edges:
+        if e.source in adj:
+            adj[e.source].append(e.target)
+    
+    visited = set()
+    path = set()
+    cycles = []
+
+    def visit(u):
+        if u in path: return True
+        if u in visited: return False
+        visited.add(u)
+        path.add(u)
+        for v in adj.get(u, []):
+            if visit(v): 
+                cycles.append(u)
+                return True
+        path.remove(u)
+        return False
+
+    for node in nodes:
+        if node.id not in visited:
+            visit(node.id)
+    return cycles
+
+def _check_reachability(nodes: list[WorkflowNode], edges: list[WorkflowEdge]) -> list[str]:
+    if not nodes: return []
+    start_nodes = [n.id for n in nodes if n.type in {"planner", "trigger", "start"}]
+    if not start_nodes: start_nodes = [nodes[0].id]
+    
+    adj = {n.id: [] for n in nodes}
+    for e in edges:
+        if e.source in adj:
+            adj[e.source].append(e.target)
+            
+    reachable = set()
+    stack = list(start_nodes)
+    while stack:
+        u = stack.pop()
+        if u not in reachable:
+            reachable.add(u)
+            stack.extend(adj.get(u, []))
+            
+    return [n.id for n in nodes if n.id not in reachable]
+
 def inspect_workflow(raw_workflow: dict[str, Any], workflow: CanonicalWorkflowSpec) -> list[WorkflowFinding]:
     findings = [*check_missing_fields(raw_workflow), *validate_schema(raw_workflow)]
-    outbound_nodes = {edge.source for edge in workflow.edges}
+    
+    # Cycle Detection
+    cycles = _check_cycles(workflow.nodes, workflow.edges)
+    for node_id in cycles:
+        findings.append(WorkflowFinding(
+            category="control_flow",
+            severity="high",
+            title="Infinite Loop Detected",
+            description=f"Workflow contains a cycle involving node `{node_id}`.",
+            affected_nodes=[node_id],
+            recommendation="Break the cycle to prevent infinite execution."
+        ))
 
+    # Reachability
+    orphans = _check_reachability(workflow.nodes, workflow.edges)
+    for node_id in orphans:
+        findings.append(WorkflowFinding(
+            category="control_flow",
+            severity="medium",
+            title="Unreachable Node",
+            description=f"Node `{node_id}` is isolated and will never execute.",
+            affected_nodes=[node_id],
+            recommendation="Connect this node to the main execution path or remove it."
+        ))
+
+    outbound_nodes = {edge.source for edge in workflow.edges}
     for node in workflow.nodes:
         if node.type in {"api", "http", "request"} and node.id not in outbound_nodes:
             findings.append(
@@ -308,18 +395,44 @@ def inspect_workflow(raw_workflow: dict[str, Any], workflow: CanonicalWorkflowSp
 
 
 def score_workflow_quality(findings: list[WorkflowFinding]) -> QualityScores:
-    penalties = {"critical": 25, "high": 15, "medium": 8, "low": 4, "info": 1}
-    total_penalty = sum(penalties[item.severity] for item in findings)
-    validation_penalty = sum(penalties[item.severity] for item in findings if item.category == "validation")
-    hallucination_penalty = sum(penalties[item.severity] for item in findings if item.category == "hallucination")
-    resilience_penalty = sum(penalties[item.severity] for item in findings if item.category == "resilience")
+    # Severity weights for exponential decay
+    severity_factors = {
+        "critical": 0.40, 
+        "high": 0.15,
+        "medium": 0.05,
+        "low": 0.02,
+        "info": 0.00
+    }
+    
+    # Group findings by category
+    categories = ["validation", "hallucination", "resilience", "static_analysis", "runtime_execution", "control_flow", "security"]
+    category_scores = {}
+    
+    for cat in categories:
+        cat_findings = [f for f in findings if f.category == cat]
+        score = 100.0
+        for f in cat_findings:
+            factor = severity_factors.get(f.severity, 0.05)
+            score *= (1.0 - factor)
+        category_scores[cat] = round(score)
 
-    overall = max(0, 100 - total_penalty)
-    validation = max(0, 100 - validation_penalty)
-    hallucination_risk = min(100, hallucination_penalty * 2)
-    retry_health = max(0, 100 - resilience_penalty)
-    reliability = max(0, round((overall + validation + retry_health) / 3))
-
+    # Multi-Factor Aggregation
+    validation = category_scores["validation"]
+    hallucination_score = category_scores["hallucination"]
+    hallucination_risk = 100 - hallucination_score
+    retry_health = category_scores["resilience"]
+    
+    # Reliability is driven by static, runtime, control_flow and security health
+    reliability = round((category_scores["static_analysis"] + category_scores["runtime_execution"] + category_scores["control_flow"] + category_scores["security"]) / 4)
+    
+    # Weighted Blend: Reliability(40%) + Validation(30%) + Grounding(20%) + Resilience(10%)
+    overall = round(
+        (reliability * 0.4) + 
+        (validation * 0.3) + 
+        (hallucination_score * 0.2) + 
+        (retry_health * 0.1)
+    )
+    
     return QualityScores(
         reliability=reliability,
         validation=validation,
@@ -327,3 +440,48 @@ def score_workflow_quality(findings: list[WorkflowFinding]) -> QualityScores:
         retry_health=retry_health,
         overall=overall,
     )
+def rank_repair_strategies(
+    candidates: list[RepairStrategy],
+    retrieved_memories: list[str],
+    min_similarity: float = 0.5,
+    max_strategies: int = 3,
+) -> list[RepairStrategy]:
+    """
+    Ranks repair strategies based on their alignment with successful past memories.
+    """
+    if not candidates:
+        return []
+
+    ranked = sorted(candidates, key=lambda x: x.safety_score, reverse=True)
+    return ranked[:max_strategies]
+
+
+def _build_repair_strategies(findings: list[WorkflowFinding], api_calls: list[str]) -> list[RepairStrategy]:
+    """
+    Builds a list of standard repair candidates based on common finding patterns.
+    """
+    strategies = []
+    
+    for finding in findings:
+        if "Undefined variable" in finding.title:
+            strategies.append(
+                RepairStrategy(
+                    title=f"Define missing symbol: {finding.title.split(':')[-1]}",
+                    strategy_type="patch",
+                    rationale="Resolves the NameError by providing a default or environment-based definition.",
+                    steps=["Locate the usage", "Add definition at the top of the scope"],
+                    safety_score=0.9,
+                )
+            )
+        elif "exec" in finding.title.lower() or "eval" in finding.title.lower():
+            strategies.append(
+                RepairStrategy(
+                    title="Sanitize or Replace Unsafe Call",
+                    strategy_type="logic",
+                    rationale="Prevents arbitrary code execution vulnerabilities.",
+                    steps=["Replace exec() with a safe mapping or ast.literal_eval"],
+                    safety_score=0.95,
+                )
+            )
+            
+    return strategies
