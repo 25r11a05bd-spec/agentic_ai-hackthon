@@ -432,6 +432,10 @@ class QARunService:
         refreshed_summary = generate_quality_report(run_id, status, scores, findings)
         markdown = generate_markdown_report(detail, refreshed_summary, failure_explanation)
         pdf_path = generate_pdf_report(markdown, self._settings.data_dir / "reports" / f"{run_id}.pdf")
+        # Save physical markdown report for easy access
+        report_md_path = Path(detail.latest_state["upload_dir"]) / "report.md"
+        report_md_path.write_text(markdown, encoding="utf-8")
+        
         await self._repository.save_report(run_id, markdown, pdf_path)
         await self._repository.save_collaboration(run_id, collaboration)
         node_status_map["finalizer"] = "completed"
