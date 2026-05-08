@@ -50,10 +50,13 @@ class ChromaMemoryService:
                 enable_ssl=settings.chroma_cloud_ssl,
             )
 
-        return chromadb.HttpClient(
-            host=settings.chroma_host,
-            port=settings.chroma_port,
-            ssl=settings.chroma_cloud_ssl,
+        # Use Local Persistent Client for development/production stability
+        # This stores the database in the backend/storage/chroma directory
+        chroma_path = settings.data_dir / "chroma"
+        chroma_path.mkdir(parents=True, exist_ok=True)
+        
+        return chromadb.PersistentClient(
+            path=str(chroma_path),
             tenant=settings.chroma_tenant,
             database=settings.chroma_database,
         )

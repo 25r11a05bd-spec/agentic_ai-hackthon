@@ -1,6 +1,7 @@
 import { AppShell } from "@/components/app-shell";
 import { DashboardCharts } from "@/components/dashboard-charts";
 import { StatCard } from "@/components/stat-card";
+import { RunsHeader } from "@/components/runs/runs-header";
 import { getMetrics, getNotificationLogs, getRuns } from "@/lib/api";
 import { requireSession } from "@/lib/session";
 
@@ -33,6 +34,7 @@ export default async function DashboardPage() {
             <strong>{metrics.approval_queue}</strong> approvals pending
           </div>
         </div>
+        <RunsHeader hideTitle />
       </div>
 
       <section className="stat-grid" style={{ marginBottom: 24 }}>
