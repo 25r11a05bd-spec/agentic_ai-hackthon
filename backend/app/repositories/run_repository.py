@@ -93,10 +93,14 @@ class FileRunRepository:
 
     async def get_run(self, run_id: str) -> QARunDetail | None:
         async with self._lock:
+            print(f"📁 [LocalRepo] Searching for run: {run_id}")
             db = self._read()
             item = db["runs"].get(run_id)
             if not item:
+                print(f"⚠️ [LocalRepo] Run {run_id} not found in repository.json")
                 return None
+            
+            print(f"✅ [LocalRepo] Run found. Loading details...")
             run = QARunRecord.model_validate(item)
             return QARunDetail(
                 **run.model_dump(),

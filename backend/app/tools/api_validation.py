@@ -15,7 +15,8 @@ async def validate_api(url: str, method: str = "HEAD") -> dict[str, Any]:
     if chosen_method not in SAFE_METHODS:
         raise ValueError(f"Unsafe validation method: {chosen_method}")
 
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+    # Reduce timeout to 2.0s for faster execution
+    async with httpx.AsyncClient(timeout=2.0, follow_redirects=True) as client:
         response = await client.request(chosen_method, url)
         return {
             "url": url,
@@ -25,7 +26,7 @@ async def validate_api(url: str, method: str = "HEAD") -> dict[str, Any]:
         }
 
 
-async def retry_request(url: str, method: str = "HEAD", attempts: int = 3) -> dict[str, Any]:
+async def retry_request(url: str, method: str = "HEAD", attempts: int = 1) -> dict[str, Any]:
     last_error: str | None = None
     for _ in range(attempts):
         try:

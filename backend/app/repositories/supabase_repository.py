@@ -73,22 +73,30 @@ class SupabaseRunRepository:
             print(f"🔍 [Supabase] Fetching run: {run_id}")
             resp = self._client.table("qa_runs").select("*").eq("id", run_id).maybe_single().execute()
             
-            if not resp.data:
+            if not resp or not resp.data:
                 print(f"⚠️ [Supabase] Run {run_id} not found in 'qa_runs' table.")
                 return None
 
             print(f"✅ [Supabase] Run found. Fetching related data...")
             run = QARunRecord.model_validate(resp.data)
 
-            # Robust retrieval with empty list fallbacks
-            events = self._client.table("playback_events").select("*").eq("run_id", run_id).order("sequence").execute().data or []
-            snapshots = self._client.table("snapshots").select("*").eq("run_id", run_id).execute().data or []
-            findings = self._client.table("findings").select("*").eq("run_id", run_id).execute().data or []
-            collab = self._client.table("collaboration").select("*").eq("run_id", run_id).execute().data or []
-            repair = self._client.table("repair_strategies").select("*").eq("run_id", run_id).execute().data or []
+            # Absolute safety guards for all related tables
+            def safe_data(res): return res.data if res else []
+
+            events_resp = self._client.table("playback_events").select("*").eq("run_id", run_id).order("sequence").execute()
+            snapshots_resp = self._client.table("snapshots").select("*").eq("run_id", run_id).execute()
+            findings_resp = self._client.table("findings").select("*").eq("run_id", run_id).execute()
+            collab_resp = self._client.table("collaboration").select("*").eq("run_id", run_id).execute()
+            repair_resp = self._client.table("repair_strategies").select("*").eq("run_id", run_id).execute()
             
             failure_resp = self._client.table("failure_explanations").select("*").eq("run_id", run_id).maybe_single().execute()
             failure_data = failure_resp.data if failure_resp else None
+
+            events = safe_data(events_resp)
+            snapshots = safe_data(snapshots_resp)
+            findings = safe_data(findings_resp)
+            collab = safe_data(collab_resp)
+            repair = safe_data(repair_resp)
 
             print(f"📊 [Supabase] Data loaded: {len(findings)} findings, {len(events)} events.")
 
@@ -105,24 +113,30 @@ class SupabaseRunRepository:
             )
         except Exception as e:
             print(f"❌ [Supabase] GetRun Critical Error: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
-    async def update_run(self, run_id: str, **updates: Any) -> QARunRecord:
-        updates["updated_at"] = utcnow().isoformat()
+    async def update_run(self, run_id: str, updates: dict[str, Any] | None = None, **kwargs: Any) -> QARunRecord:
+        # Merge dictionary updates and keyword updates
+        final_updates = updates or {}
+        final_updates.update(kwargs)
+        
+        final_updates["updated_at"] = utcnow().isoformat()
 
         # Ensure all Pydantic models in updates are converted to JSON-serializable dicts
-        for key, value in updates.items():
+        for key, value in final_updates.items():
             if hasattr(value, "model_dump"):
-                updates[key] = value.model_dump(mode="json")
+                final_updates[key] = value.model_dump(mode="json")
 
-        if "latest_state" in updates:
+        if "latest_state" in final_updates:
             current = self._client.table("qa_runs").select("latest_state").eq("id", run_id).maybe_single().execute()
             existing = (current.data or {}).get("latest_state") or {}
             # Merge if it's a dict
-            if isinstance(updates["latest_state"], dict):
-                updates["latest_state"] = {**existing, **updates["latest_state"]}
+            if isinstance(final_updates["latest_state"], dict):
+                final_updates["latest_state"] = {**existing, **final_updates["latest_state"]}
 
-        response = self._client.table("qa_runs").update(updates).eq("id", run_id).execute()
+        response = self._client.table("qa_runs").update(final_updates).eq("id", run_id).execute()
         return QARunRecord.model_validate(response.data[0])
 
     # ------------------------------------------------------------------ #

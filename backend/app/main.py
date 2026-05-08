@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import asyncio
+import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,6 +42,11 @@ app.add_middleware(
 
 app.include_router(api_v1_router)
 app.include_router(websocket_router)
+
+# Debug: Log all routes to verify WebSocket registration
+for route in app.routes:
+    if hasattr(route, 'path'):
+        logger.info(f"🔗 Registered route: {route.path} [{type(route).__name__}]")
 
 
 @app.get("/health")

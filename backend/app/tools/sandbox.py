@@ -2,6 +2,7 @@ import asyncio
 import sys
 import tempfile
 import json
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -69,20 +70,30 @@ async def run_in_sandbox(code: str, timeout: float = 10.0) -> Dict[str, Any]:
         # Create the harness
         (dir_path / "harness.py").write_text(HARNESS_TEMPLATE, encoding="utf-8")
         
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, "harness.py",
-            cwd=tmp_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
+        # Use subprocess.run in a thread pool with timeout
+        def run_subprocess():
+            try:
+                return subprocess.run(
+                    [sys.executable, "harness.py"],
+                    cwd=tmp_dir,
+                    capture_output=True,
+                    timeout=timeout
+                ), None
+            except subprocess.TimeoutExpired as e:
+                return None, str(e)
+        
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            result, error = await asyncio.wait_for(asyncio.to_thread(run_subprocess), timeout=timeout + 2)
+            if error:
+                return {"success": False, "error": f"Execution Timeout: {error}"}
+            if result is None:
+                return {"success": False, "error": "Execution Timeout"}
+            stdout = result.stdout
+            stderr = result.stderr
         except asyncio.TimeoutError:
-            process.kill()
             return {"success": False, "error": "Execution Timeout"}
 
-        stdout_str = stdout.decode().strip()
+        stdout_str = stdout.decode().strip() if stdout else ""
         if "---HARNESS_RESULTS---" in stdout_str:
             json_str = stdout_str.split("---HARNESS_RESULTS---")[-1].strip()
             return json.loads(json_str)
@@ -90,7 +101,7 @@ async def run_in_sandbox(code: str, timeout: float = 10.0) -> Dict[str, Any]:
         return {
             "success": False,
             "init_success": False,
-            "init_error": stderr.decode() or "Failed to parse harness output",
+            "init_error": stderr.decode() if stderr else "Failed to parse harness output",
             "stdout": stdout_str
         }
 

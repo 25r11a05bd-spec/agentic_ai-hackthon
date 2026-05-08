@@ -104,9 +104,11 @@ class SecurityVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 def analyze_python_code(source: str) -> PythonAnalysis:
+    print("🔍 [StaticAnalysis] Starting Python source analysis...")
     try:
         # Initial pass to define all names
         tree = ast.parse(source)
+        print("✅ [StaticAnalysis] AST parsed successfully. Starting symbol scan...")
         visitor = SecurityVisitor()
         
         # Double-scan the whole tree first for globals and functions

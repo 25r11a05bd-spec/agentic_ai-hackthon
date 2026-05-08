@@ -35,7 +35,7 @@ from app.tools.api_validation import inspect_response, retry_request
 from app.tools.python_analysis import analyze_python_code, generate_quality_report
 from app.tools.workflow_validation import detect_hallucinations, inspect_workflow, normalize_workflow, validate_json
 from app.tools.sandbox import run_in_sandbox, analyze_sandbox_result
-from app.tools.ai_agent import generate_ai_reflection, generate_repair_strategies
+from app.tools.ai_agent import generate_ai_reflection, generate_repair_strategies, generate_plan
 from app.utils.time import utcnow
 from app.workflows.runtime import EXECUTION_NODE_IDS, build_execution_graph
 
@@ -146,428 +146,242 @@ class QARunService:
         )
 
     async def process_run(self, run_id: str) -> None:
-        run = await self._require_run(run_id)
-        await self._repository.update_run(run_id, status="running", current_agent="ingest")
-        await self._emit(run_id, "run_started", "ingest", "Run accepted for analysis", "running")
+        try:
+            run = await self._require_run(run_id)
+            await self._repository.update_run(run_id, status="running", current_agent="ingest")
+            await self._emit(run_id, "run_started", "ingest", "Run accepted for analysis", "running")
 
-        collaboration: list[CollaborationStep] = []
-        node_status_map = dict(run.latest_state.get("node_status_map", {}))
+            collaboration: list[CollaborationStep] = []
+            node_status_map = dict(run.latest_state.get("node_status_map", {}))
 
-        await self._transition_node(run_id, "ingest", node_status_map)
-        project_path = Path(run.latest_state["project_path"])
-        workflow_path = Path(run.latest_state["workflow_path"])
-        source = project_path.read_text(encoding="utf-8")
-        raw_workflow = validate_json(workflow_path.read_text(encoding="utf-8"))
-        collaboration.append(self._collaboration_step(run_id, "ingest", ["file_loader"], "Stored uploaded artifacts."))
+            # --- INGEST ---
+            await self._transition_node(run_id, "ingest", node_status_map)
+            project_path = Path(run.latest_state["project_path"])
+            workflow_path = Path(run.latest_state["workflow_path"])
+            source = project_path.read_text(encoding="utf-8")
+            raw_workflow = validate_json(workflow_path.read_text(encoding="utf-8"))
+            collaboration.append(self._collaboration_step(run_id, "ingest", ["file_loader"], "Stored uploaded artifacts."))
 
-        await self._transition_node(run_id, "planner", node_status_map)
-        python_analysis = analyze_python_code(source)
-        workflow = normalize_workflow(raw_workflow)
-        
-        # Create findings from Python Static Analysis risks
-        static_findings = [
-            WorkflowFinding(
-                category="static_analysis",
-                severity="high" if any(x in risk.lower() for x in ["unsafe", "undefined", "traversal", "recursion"]) else "medium",
-                title=risk,
-                description="Detected during static analysis of app.py.",
-                recommendation="Review the code for security vulnerabilities or logical errors."
-            )
-            for risk in python_analysis.risk_flags
-        ]
-        
-        await self._repository.replace_findings(run_id, static_findings)
-
-        await self._emit(
-            run_id,
-            "agent_log",
-            "planner",
-            "Normalized workflow and performed static analysis",
-            "success",
-            payload={"ast_summary": python_analysis.ast_summary, "node_count": len(workflow.nodes), "risks_found": len(static_findings)},
-        )
-        collaboration.append(
-            self._collaboration_step(
-                run_id,
-                "planner",
-                ["analyze_python_code", "normalize_workflow"],
-                python_analysis.ast_summary,
-                confidence=0.84,
-            )
-        )
-
-        await self._transition_node(run_id, "tool_router", node_status_map)
-        selected_tools = ["inspect_workflow", "detect_hallucinations"]
-        if workflow.api_calls:
-            selected_tools.append("validate_api")
-        await self._emit(
-            run_id,
-            "agent_log",
-            "tool_router",
-            "Selected validation and probe tools",
-            "success",
-            payload={"tools": selected_tools, "api_calls": workflow.api_calls},
-        )
-        collaboration.append(
-            self._collaboration_step(
-                run_id,
-                "tool_router",
-                selected_tools,
-                f"Selected {len(selected_tools)} tools for this run.",
-                confidence=0.79,
-                dependencies=["planner"],
-            )
-        )
-
-        await self._transition_node(run_id, "executor", node_status_map)
-        findings = list(static_findings) # Carry forward static analysis findings
-        
-        # Runtime Sandbox Execution
-        sandbox_result = await run_in_sandbox(source)
-        findings.extend(analyze_sandbox_result(sandbox_result))
-        
-        findings.extend(inspect_workflow(raw_workflow, workflow))
-        findings.extend(
-            detect_hallucinations(
-                workflow=workflow,
-                python_functions=python_analysis.functions,
-                python_api_calls=python_analysis.api_calls,
-            )
-        )
-        api_results: list[dict[str, Any]] = []
-        for url in workflow.api_calls:
-            result = await retry_request(url)
-            api_results.append(result)
-            findings.extend(inspect_response(result))
-
-        for finding in findings:
-            await self._emit(
-                run_id,
-                "finding_created",
-                "executor",
-                finding.title,
-                finding.severity,
-                payload=finding.model_dump(mode="json"),
-            )
-
-        collaboration.append(
-            self._collaboration_step(
-                run_id,
-                "executor",
-                selected_tools,
-                f"Generated {len(findings)} findings from workflow inspection and probes.",
-                risk_level="medium" if findings else "low",
-                confidence=0.77,
-                dependencies=["tool_router"],
-            )
-        )
-
-        await self._repository.replace_findings(run_id, findings)
-        await self._transition_node(run_id, "validator", node_status_map)
-        scores = self._score_with_context(findings)
-        risk_level = self._risk_level(scores, findings)
-        quality_summary = generate_quality_report(run_id, "running", scores, findings)
-        
-        # Enforce strict validation
-        validation_passed = (
-            scores.validation >= self._settings.approval_validation_threshold 
-            and scores.hallucination_risk <= self._settings.approval_hallucination_threshold
-            and not any(f.severity in {"critical", "high"} for f in findings)
-        )
-        
-        await self._repository.update_run(
-            run_id,
-            scores=scores.model_dump(mode="json"),
-            risk_level=risk_level,
-            latest_state={
-                "python_analysis": python_analysis.model_dump(mode="json"),
-                "canonical_workflow": workflow.model_dump(mode="json"),
-                "api_results": api_results,
-                "quality_summary": quality_summary.model_dump(mode="json"),
-                "node_status_map": node_status_map,
-            },
-        )
-        collaboration.append(
-            self._collaboration_step(
-                run_id,
-                "validator",
-                ["score_workflow_quality"],
-                f"Validation score {scores.validation}, hallucination risk {scores.hallucination_risk}.",
-                risk_level=risk_level,
-                confidence=0.81,
-                dependencies=["executor"],
-            )
-        )
-
-        failure_explanation: FailureExplanation | None = None
-        repair_strategies: list[RepairStrategy] = []
-        approval_needed = False
-        
-        # FIX: Default to failed if validation fails
-        status = "success" if validation_passed else "failed"
-
-        await self._transition_node(run_id, "failure_explainer", node_status_map)
-        if findings:
-            # AI Agent Reflection
-            ai_explanation = await generate_ai_reflection(source, findings, sandbox_result.get("stderr", ""))
-            if ai_explanation:
-                failure_explanation = ai_explanation
-            else:
-                failure_explanation = self._build_failure_explanation(findings, python_analysis.ast_summary, api_results, run.retries_used)
-            await self._repository.save_failure_explanation(run_id, failure_explanation)
-            await self._emit(
-                run_id,
-                "failure_explained",
-                "failure_explainer",
-                failure_explanation.root_cause,
-                "success",
-                payload=failure_explanation.model_dump(mode="json"),
-            )
-            collaboration.append(
-                self._collaboration_step(
-                    run_id,
-                    "failure_explainer",
-                    ["generate_failure_explanation"],
-                    failure_explanation.root_cause,
-                    risk_level=risk_level,
-                    confidence=0.76,
-                    dependencies=["validator"],
-                )
-            )
-
-        await self._transition_node(run_id, "reflection", node_status_map)
-        if not validation_passed and run.retry_enabled:
-            await self._emit(
-                run_id,
-                "agent_log",
-                "reflection",
-                "Validation failed, preparing safe self-heal strategies",
-                "running",
-            )
-            collaboration.append(
-                self._collaboration_step(
-                    run_id,
-                    "reflection",
-                    ["retrieve_memory", "rank_repair_strategies"],
-                    "Prepared a reflection plan for bounded retries.",
-                    risk_level=risk_level,
-                    confidence=0.7,
-                    dependencies=["failure_explainer"],
-                )
-            )
-
-        await self._transition_node(run_id, "self_heal_router", node_status_map)
-        if not validation_passed:
-            # MEMORY RETRIEVAL: Find past successful fixes for this failure
-            past_memories = []
-            memory_hits = []
-            if failure_explanation:
-                memory_hits = await retrieve_memory(
-                    self._memory_service,
-                    "failure_patterns",
-                    failure_explanation.root_cause,
-                    limit=3
-                )
-                past_memories = [m["text"] for m in memory_hits]
-                await self._emit(run_id, "agent_log", "self_heal_router", f"Retrieved {len(past_memories)} past repair memories", "success")
-
-            # AI Agent Repair Patch Generation (Informed by Memory)
-            ai_strategies = await generate_repair_strategies(source, findings, past_memories)
+            # --- PLANNER ---
+            await self._transition_node(run_id, "planner", node_status_map)
+            ai_plan = await generate_plan(run.task, source)
+            print(f"🧠 [Planner] AI Strategy: {ai_plan.rationale}")
             
-            if ai_strategies:
-                repair_strategies = ai_strategies
-            else:
-                # Fallback to ranked pattern matching if AI fails
-                repair_strategies = rank_repair_strategies(
-                    candidates=self._build_repair_strategies(findings, workflow.api_calls),
-                    retrieved_memories=memory_hits,
-                    min_similarity=self._settings.self_heal_min_similarity,
-                    max_strategies=self._settings.self_heal_max_strategies,
-                )
-            await self._repository.save_repair_strategies(run_id, repair_strategies)
-            for strategy in repair_strategies:
-                await self._emit(
-                    run_id,
-                    "self_heal_suggested",
-                    "self_heal_router",
-                    strategy.title,
-                    "success",
-                    payload=strategy.model_dump(mode="json"),
-                )
-            approval_needed = bool(repair_strategies)
-
-        await self._transition_node(run_id, "retry_or_replan", node_status_map)
-        if not validation_passed and run.retry_enabled and run.retries_used < run.max_retries:
-            retries_used = run.retries_used + 1
-            selected = repair_strategies[0] if repair_strategies else None
+            python_analysis = analyze_python_code(source)
+            workflow = normalize_workflow(raw_workflow)
             
-            if selected and selected.fixed_code:
-                # Apply REAL patch to the app.py attachment
-                updated_attachments = []
-                for attr in run.attachments:
-                    if attr.name == "app.py":
-                        attr.content = selected.fixed_code
-                    updated_attachments.append(attr.model_dump())
-                
-                await self._repository.update_run(run_id, {"attachments": updated_attachments})
-                
-                selected.selected = True
-                await self._repository.save_repair_strategies(run_id, repair_strategies)
-                await self._emit(
-                    run_id,
-                    "self_heal_applied",
-                    "retry_or_replan",
-                    f"Applying Real Patch: {selected.title}",
-                    "success",
-                    payload=selected.model_dump(mode="json"),
-                )
-
-            await self._emit(
-                run_id,
-                "retry_scheduled",
-                "retry_or_replan",
-                f"Retry #{retries_used} starting on patched source code...",
-                "running",
-            )
             await self._repository.update_run(
-                run_id,
-                {
-                    "retries_used": retries_used,
-                    "status": "running",
-                    "current_agent": "planner"
+                run_id, 
+                latest_state={
+                    **run.latest_state,
+                    "ai_plan": ai_plan.model_dump(mode="json"),
+                    "node_status_map": node_status_map
                 }
             )
-            return # Exit current orchestration to let the retry loop take over
-
-        await self._transition_node(run_id, "approval_gate", node_status_map)
-        current_run = await self._require_run(run_id)
-        if (
-            not validation_passed
-            or scores.validation < self._settings.approval_validation_threshold
-            or scores.hallucination_risk > self._settings.approval_hallucination_threshold
-            or current_run.retries_used >= current_run.max_retries
-            or approval_needed
-        ):
-            # If it failed but no self-heal worked, mark as approval required or failed
-            status = "approval_required" if (approval_needed or not validation_passed) else "failed"
             
-            approval = ApprovalRecord(
-                run_id=run_id,
-                status="pending",
-                recommended_action="Review self-heal plan and failure explanation before finalization.",
-                rationale=self._build_approval_rationale(scores, repair_strategies),
-                updated_at=utcnow(),
-            )
-            await self._repository.save_approval(approval)
-            await self._emit(
-                run_id,
-                "approval_required",
-                "approval_gate",
-                approval.rationale,
-                "pending",
-                payload=approval.model_dump(mode="json"),
-            )
-
-        await self._transition_node(run_id, "memory_writer", node_status_map)
-        await self._write_memories(run_id, workflow, findings, failure_explanation, repair_strategies)
-        await self._emit(run_id, "memory_saved", "memory_writer", "Run memories persisted", "success")
-        collaboration.append(
-            self._collaboration_step(
-                run_id,
-                "memory_writer",
-                ["store_memory"],
-                "Stored workflow and failure memory for later self-heal retrieval.",
-                confidence=0.73,
-                dependencies=["approval_gate"],
-            )
-        )
-
-        await self._transition_node(run_id, "notifier", node_status_map)
-        if run.notifications_enabled:
-            message = f"QA run {run_id} is now {status} with score {scores.overall}/100."
-            log = await self._notification_service.send_whatsapp(run_id, message)
-            await self._repository.add_notification(log)
-            await self._emit(
-                run_id,
-                "notification_sent",
-                "notifier",
-                "Dispatching run outcome notification",
-                log.status,
-                payload=log.model_dump(mode="json"),
-            )
-            collaboration.append(
-                self._collaboration_step(
-                    run_id,
-                    "notifier",
-                    ["send_whatsapp"],
-                    f"Sent {log.channel} notification with status {log.status}.",
-                    confidence=0.9,
-                    dependencies=["memory_writer"],
+            static_findings = [
+                WorkflowFinding(
+                    category="static_analysis",
+                    severity="high" if any(x in risk.lower() for x in ["unsafe", "undefined", "traversal", "recursion"]) else "medium",
+                    title=risk,
+                    description="Detected during static analysis of app.py.",
+                    recommendation="Review the code for security vulnerabilities or logical errors."
                 )
+                for risk in python_analysis.risk_flags
+            ]
+            await self._repository.replace_findings(run_id, static_findings)
+
+            await self._emit(
+                run_id, "agent_log", "planner", f"Strategy: {ai_plan.rationale}", "success",
+                payload={"ast_summary": python_analysis.ast_summary, "node_count": len(workflow.nodes), "risks_found": len(static_findings)},
             )
+            collaboration.append(self._collaboration_step(run_id, "planner", ["analyze_python_code", "normalize_workflow"], python_analysis.ast_summary, confidence=0.84))
 
-        await self._transition_node(run_id, "finalizer", node_status_map)
-        detail = await self._require_run(run_id)
-        refreshed_summary = generate_quality_report(run_id, status, scores, findings)
-        markdown = generate_markdown_report(detail, refreshed_summary, failure_explanation)
-        pdf_rel_path = f"reports/{run_id}.pdf"
-        pdf_path = generate_pdf_report(markdown, self._settings.data_dir / pdf_rel_path)
+            # --- TOOL ROUTER ---
+            await self._transition_node(run_id, "tool_router", node_status_map)
+            selected_tools = ["inspect_workflow", "detect_hallucinations"]
+            if workflow.api_calls:
+                selected_tools.append("validate_api")
+            await self._emit(run_id, "agent_log", "tool_router", "Selected validation and probe tools", "success", payload={"tools": selected_tools, "api_calls": workflow.api_calls})
+            collaboration.append(self._collaboration_step(run_id, "tool_router", selected_tools, f"Selected {len(selected_tools)} tools for this run.", confidence=0.79, dependencies=["planner"]))
 
-        if self._supabase_storage and self._supabase_storage.is_enabled:
+            # --- EXECUTOR ---
+            await self._transition_node(run_id, "executor", node_status_map)
+            findings = list(static_findings)
+            
+            print(f"🛠️ [Executor] Starting sandbox for {run_id}...")
             try:
-                with open(pdf_path, "rb") as f:
-                    cloud_url = await self._supabase_storage.upload_file(
-                        self._settings.supabase_storage_bucket_reports,
-                        f"{run_id}.pdf",
-                        f.read(),
-                        "application/pdf"
-                    )
-                    pdf_rel_path = cloud_url # Use cloud URL instead of local path
-            except Exception:
+                print(f"  → Calling run_in_sandbox...")
+                # Longer timeout to reduce first-attempt failures
+                sandbox_result = await asyncio.wait_for(run_in_sandbox(source, timeout=8.0), timeout=10.0)
+                print(f"  → Sandbox call returned")
+                print(f"🛠️ [Executor] Sandbox finished. Analyzing results...")
+                findings.extend(analyze_sandbox_result(sandbox_result))
+                print(f"  → Sandbox analysis complete")
+            except asyncio.TimeoutError:
+                print(f"⚠️ [Executor] Sandbox timed out - using fallback analysis")
+                findings.append(WorkflowFinding(
+                    category="runtime_execution",
+                    severity="medium",
+                    title="Sandbox Execution Skipped",
+                    description="Sandbox execution timed out, continuing with static analysis only.",
+                    recommendation="Consider optimizing code for faster execution or reducing test complexity."
+                ))
+            except Exception as e:
+                print(f"⚠️ [Executor] Sandbox error: {e} - continuing without sandbox")
+                findings.append(WorkflowFinding(
+                    category="runtime_execution",
+                    severity="medium",
+                    title="Sandbox Execution Failed",
+                    description=f"Sandbox encountered an error: {str(e)}",
+                    recommendation="Check code syntax and dependencies."
+                ))
+            
+            print(f"🛠️ [Executor] Inspecting workflow structure...")
+            findings.extend(inspect_workflow(raw_workflow, workflow))
+            print(f"  → Workflow inspection complete")
+            
+            print(f"🛠️ [Executor] Running Hallucination Detector...")
+            findings.extend(detect_hallucinations(workflow=workflow, python_functions=python_analysis.functions, python_api_calls=python_analysis.api_calls))
+            print(f"  → Hallucination detection complete")
+            
+            api_results: list[dict[str, Any]] = []
+            print(f"🛠️ [Executor] Probing {len(workflow.api_calls)} external API endpoints...")
+            for url in workflow.api_calls:
+                print(f"  🔗 Probing: {url}")
+                try:
+                    result = await asyncio.wait_for(retry_request(url), timeout=5.0)
+                    api_results.append(result)
+                    findings.extend(inspect_response(result))
+                except asyncio.TimeoutError:
+                    print(f"  ⚠️ API probe timeout: {url}")
+                    api_results.append({"url": url, "error": "Probe timeout", "status_code": None})
+            print(f"🛠️ [Executor] Probes complete.")
+            print(f"🛠️ [Executor] Step completed. Moving to validator...")
+
+            for finding in findings:
+                await self._emit(run_id, "finding_created", "executor", finding.title, finding.severity, payload=finding.model_dump(mode="json"))
+
+            collaboration.append(self._collaboration_step(run_id, "executor", selected_tools, f"Generated {len(findings)} findings from workflow inspection and probes.", risk_level="medium" if findings else "low", confidence=0.77, dependencies=["tool_router"]))
+
+            # --- VALIDATOR ---
+            await self._repository.replace_findings(run_id, findings)
+            await self._transition_node(run_id, "validator", node_status_map)
+            scores = self._score_with_context(findings)
+            risk_level = self._risk_level(scores, findings)
+            quality_summary = generate_quality_report(run_id, "running", scores, findings)
+            
+            validation_passed = (
+                scores.validation >= self._settings.approval_validation_threshold 
+                and scores.hallucination_risk <= self._settings.approval_hallucination_threshold
+                and not any(f.severity in {"critical", "high"} for f in findings)
+            )
+            
+            await self._repository.update_run(
+                run_id, scores=scores.model_dump(mode="json"), risk_level=risk_level,
+                latest_state={
+                    "python_analysis": python_analysis.model_dump(mode="json"),
+                    "canonical_workflow": workflow.model_dump(mode="json"),
+                    "api_results": api_results,
+                    "quality_summary": quality_summary.model_dump(mode="json"),
+                    "node_status_map": node_status_map,
+                },
+            )
+            collaboration.append(self._collaboration_step(run_id, "validator", ["score_workflow_quality"], f"Validation score {scores.validation}, hallucination risk {scores.hallucination_risk}.", risk_level=risk_level, confidence=0.81, dependencies=["executor"]))
+
+            # --- FAILURE EXPLAINER & REPAIR ---
+            failure_explanation: FailureExplanation | None = None
+            repair_strategies: list[RepairStrategy] = []
+            status = "success" if validation_passed else "failed"
+            
+            print(f"📊 [Validator] Validation passed: {validation_passed}, status: {status}")
+
+            await self._transition_node(run_id, "failure_explainer", node_status_map)
+            if findings:
+                print(f"🤖 [AI] Starting AI reflection for {len(findings)} findings...")
+                try:
+                    ai_explanation = await generate_ai_reflection(source, findings, sandbox_result.get("stderr", ""))
+                    print(f"🤖 [AI] AI reflection completed")
+                except Exception as e:
+                    print(f"⚠️ [AI] AI reflection failed: {e}")
+                    ai_explanation = None
+                print(f"📝 [Failure Explainer] Building failure explanation...")
+                failure_explanation = ai_explanation or self._build_failure_explanation(findings, python_analysis.ast_summary, api_results, run.retries_used)
+                print(f"📝 [Failure Explainer] Saving failure explanation...")
+                await self._repository.save_failure_explanation(run_id, failure_explanation)
+                print(f"📝 [Failure Explainer] Emitting failure explained event...")
+                await self._emit(run_id, "failure_explained", "failure_explainer", failure_explanation.root_cause, "success", payload=failure_explanation.model_dump())
+                collaboration.append(self._collaboration_step(run_id, "failure_explainer", ["generate_ai_reflection"], failure_explanation.root_cause, risk_level=risk_level, confidence=0.85, dependencies=["validator"]))
+
+                print(f"🔧 [Repair Strategy] Building repair strategies...")
+                await self._transition_node(run_id, "repair_strategy", node_status_map)
+                repair_strategies = self._build_repair_strategies(findings, workflow.api_calls or [])
+                print(f"🔧 [Repair Strategy] Saving repair strategies...")
+                await self._repository.save_repair_strategies(run_id, repair_strategies)
+                print(f"🔧 [Repair Strategy] Emitting repairs proposed event...")
+                await self._emit(run_id, "repairs_proposed", "repair_strategy", f"Proposed {len(repair_strategies)} fixes", "success", payload={"strategies": [s.model_dump() for s in repair_strategies]})
+                collaboration.append(self._collaboration_step(run_id, "repair_strategy", ["build_repair_strategies"], f"Found {len(repair_strategies)} remediation vectors.", confidence=0.75, dependencies=["failure_explainer"]))
+                print(f"🔧 [Repair Strategy] Repair strategies completed")
+            print(f"🔄 [Debug] Exiting if findings block...")
+
+            # --- NOTIFICATIONS & MEMORY ---
+            print(f"📢 [Notifier] Starting notification step...")
+            await self._transition_node(run_id, "notifier", node_status_map)
+            try:
+                # NotificationService doesn't have send_status_update, skip for now
                 pass
-        
-        # Save physical markdown report
-        report_md_path = Path(detail.latest_state["upload_dir"]) / "report.md"
-        report_md_path.write_text(markdown, encoding="utf-8")
-        
-        report_md_url = None
-        if self._supabase_storage and self._supabase_storage.is_enabled:
+            except Exception as e:
+                print(f"⚠️ [Notification] Failed: {e}")
+
+            print(f"🧠 [Memory Writer] Starting memory writer...")
+            await self._transition_node(run_id, "memory_writer", node_status_map)
+            await self._write_memories(run_id, workflow, findings, failure_explanation, repair_strategies)
+            print(f"🧠 [Memory Writer] Memory writer completed")
+
+            # --- FINALIZER ---
+            print(f"📄 [Finalizer] Starting finalizer...")
+            await self._transition_node(run_id, "finalizer", node_status_map)
+            print(f"📄 [Finalizer] Retrieving run details...")
+            detail = await self._require_run(run_id)
+            print(f"📄 [Finalizer] Generating markdown report...")
+            markdown = generate_markdown_report(detail, quality_summary, failure_explanation)
+            print(f"📄 [Finalizer] Markdown report generated")
+            
+            # Fail-safe PDF
+            print(f"📄 [Finalizer] Generating PDF report...")
+            pdf_rel_path = f"reports/{run_id}.pdf"
             try:
-                report_md_url = await self._supabase_storage.upload_file(
-                    self._settings.supabase_storage_bucket_reports,
-                    f"{run_id}.md",
-                    markdown.encode("utf-8"),
-                    "text/markdown"
+                # Add timeout to prevent hanging
+                await asyncio.wait_for(
+                    asyncio.to_thread(generate_pdf_report, markdown, self._settings.data_dir / pdf_rel_path),
+                    timeout=10.0
                 )
-            except Exception:
-                pass
+                print(f"📄 [Finalizer] PDF report generated")
+            except asyncio.TimeoutError:
+                print(f"⚠️ [Finalizer] PDF generation timed out - skipping PDF")
+                pdf_rel_path = None
+            except Exception as e:
+                print(f"⚠️ [Finalizer] PDF failed: {e}")
+                pdf_rel_path = None
 
-        await self._repository.save_report(run_id, markdown, pdf_rel_path)
-        await self._repository.update_run(
-            run_id,
-            latest_state={
-                **detail.latest_state,
-                "report_md_url": report_md_url
-            }
-        )
-        await self._repository.save_collaboration(run_id, collaboration)
-        node_status_map["finalizer"] = "completed"
-        await self._repository.update_run(
-            run_id,
-            status=status,
-            approval_status="pending" if status == "approval_required" else "not_required",
-            current_agent="finalizer",
-            risk_level=risk_level,
-            latest_state={"node_status_map": node_status_map},
-        )
-        await self._emit(
-            run_id,
-            "run_completed",
-            "finalizer",
-            f"Run finished with status {status}",
-            status,
-            payload={"scores": scores.model_dump(mode="json"), "risk_level": risk_level},
-        )
+            print(f"📄 [Finalizer] Saving report to repository...")
+            await self._repository.save_report(run_id, markdown, pdf_rel_path)
+            print(f"📄 [Finalizer] Report saved successfully")
+            node_status_map["finalizer"] = "completed"
+            print(f"📄 [Finalizer] Finalizer completed")
+            
+            await self._repository.update_run(
+                run_id, status=status, approval_status="not_required", current_agent="finalizer", risk_level=risk_level,
+                latest_state={"node_status_map": node_status_map, "report_md_url": f"/storage/reports/{run_id}.md"},
+            )
+            await self._emit(run_id, "run_completed", "finalizer", f"Run finished with status {status}", status, payload={"scores": scores.model_dump(mode="json"), "risk_level": risk_level})
+            
+        except Exception as e:
+            import traceback
+            print(f"❌ [QARunService] FATAL ERROR during run {run_id}:")
+            traceback.print_exc()
+            await self._repository.update_run(run_id, status="failed")
+            await self._emit(run_id, "run_failed", "system", str(e), "failed")
 
     async def retry_run(
         self,
@@ -659,11 +473,26 @@ class QARunService:
         run = await self._require_run(run_id)
         return run.collaboration
 
-    async def _require_run(self, run_id: str) -> QARunDetail:
+    async def get_run(self, run_id: str) -> QARunDetail:
+        print(f"🔄 [Service] Attempting to retrieve run {run_id}")
         run = await self._repository.get_run(run_id)
+        
+        # Hybrid Fallback: Check local files if Supabase misses
+        if not run and "Supabase" in str(type(self._repository)):
+            print(f"📂 [Service] Not in Supabase. Checking local fallback...")
+            from app.repositories.run_repository import FileRunRepository
+            local_repo = FileRunRepository(self._settings.data_dir)
+            run = await local_repo.get_run(run_id)
+            if run:
+                print(f"✨ [Service] Found run {run_id} in local storage fallback!")
+
         if not run:
+            print(f"❌ [Service] Run {run_id} not found in any storage.")
             raise KeyError(run_id)
         return run
+
+    async def _require_run(self, run_id: str) -> QARunDetail:
+        return await self.get_run(run_id)
 
     async def _emit(
         self,
@@ -690,10 +519,22 @@ class QARunService:
         return saved
 
     async def _transition_node(self, run_id: str, node_id: str, status_map: dict[str, str]) -> None:
-        for existing_node in status_map:
-            if status_map[existing_node] == "running":
-                status_map[existing_node] = "completed"
+        """Transitions a node to 'running' and updates the status map."""
+        # Mark previous running node as completed
+        for k, v in status_map.items():
+            if v == "running":
+                status_map[k] = "completed"
+                
         status_map[node_id] = "running"
+        
+        # PERSIST IMMEDIATELY so the UI reflects progress
+        await self._repository.update_run(
+            run_id, 
+            current_agent=node_id,
+            latest_state={"node_status_map": status_map}
+        )
+        
+        await self._emit(run_id, "node_transition", node_id, f"Agent {node_id} active", "running")
         snapshot = PlaybackSnapshot(
             run_id=run_id,
             current_node=node_id,

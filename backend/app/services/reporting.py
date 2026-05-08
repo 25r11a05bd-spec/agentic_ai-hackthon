@@ -48,6 +48,17 @@ def generate_markdown_report(
             f"**Recommended Fix:** {failure_explanation.recommended_fix}"
         )
 
+    repairs = ""
+    if run.repair_strategies:
+        repairs = "\n## 🛠️ Proposed Repairs & Autonomous Patches\n"
+        for strategy in run.repair_strategies:
+            repairs += f"\n### Strategy: {strategy.title}\n"
+            repairs += f"**Safety Score:** {strategy.safety_score * 100:.1f}%\n"
+            repairs += f"**Reasoning:** {strategy.rationale}\n"
+            if strategy.fixed_code:
+                repairs += "\n#### Suggested Code Patch:\n"
+                repairs += f"```python\n{strategy.fixed_code}\n```\n"
+
     return (
         f"# QA Run Report: {run.id}\n\n"
         f"## 📊 Executive Quality Summary\n"
@@ -64,6 +75,7 @@ def generate_markdown_report(
         f"{explanation}\n\n"
         f"## 📜 Agent Execution Timeline\n\n"
         f"{_format_events(run.playback)}\n"
+        f"{repairs}"
     )
 
 import re
@@ -111,9 +123,41 @@ def generate_pdf_report(markdown: str, output_path: Path) -> str | None:
         bulletFontName="Helvetica"
     )
 
+    code_style = ParagraphStyle(
+        "CodeStyle",
+        parent=body_style,
+        fontName="Courier",
+        fontSize=9,
+        leftIndent=15,
+        rightIndent=15,
+        backColor="#f4f4f4",
+        borderPadding=5,
+        leading=12
+    )
+
     elements = []
 
+    in_code_block = False
+    code_content = []
+
     for line in markdown.splitlines():
+        # Handle Code Block Toggles
+        if line.strip().startswith("```"):
+            if in_code_block:
+                # Close block and render
+                elements.append(Paragraph("<br/>".join(code_content), code_style))
+                code_content = []
+                in_code_block = False
+            else:
+                in_code_block = True
+            continue
+
+        if in_code_block:
+            # Escape HTML characters in code
+            escaped = line.replace("<", "&lt;").replace(">", "&gt;")
+            code_content.append(f"<font name='Courier'>{escaped}</font>")
+            continue
+
         line = line.strip()
         if not line:
             elements.append(Spacer(1, 8))
@@ -131,7 +175,7 @@ def generate_pdf_report(markdown: str, output_path: Path) -> str | None:
         elif line.startswith("### "):
             elements.append(Paragraph(processed_line[4:], h2_style))
         elif line.startswith("- "):
-            elements.append(Paragraph(f"&bull; {processed_line[2:]}", list_style))
+            elements.append(Paragraph(processed_line[2:], list_style))
         else:
             elements.append(Paragraph(processed_line, body_style))
 
@@ -139,5 +183,5 @@ def generate_pdf_report(markdown: str, output_path: Path) -> str | None:
         doc.build(elements)
         return str(output_path)
     except Exception as e:
-        print(f"PDF Generation Error: {e}")
+        print(f"PDF Build Error: {e}")
         return None

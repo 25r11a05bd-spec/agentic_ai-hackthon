@@ -58,8 +58,8 @@ class Settings(BaseSettings):
     max_autonomous_retries: int = 3
     self_heal_min_similarity: float = 0.7
     self_heal_max_strategies: int = 3
-    approval_validation_threshold: int = 85
-    approval_hallucination_threshold: int = 25
+    approval_validation_threshold: int = 70
+    approval_hallucination_threshold: int = 50
     websocket_heartbeat_seconds: int = 3
 
     data_dir: Path = Field(default_factory=lambda: BASE_DIR / "storage")

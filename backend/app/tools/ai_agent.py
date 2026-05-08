@@ -144,3 +144,57 @@ async def generate_repair_strategies(
     except Exception as e:
         print(f"AI Repair Error: {e}")
         return []
+
+class PlanStep(BaseModel):
+    agent: str
+    action: str
+    expected_outcome: str
+
+class ExecutionPlan(BaseModel):
+    rationale: str
+    steps: list[PlanStep]
+
+async def generate_plan(task: str, code: str) -> ExecutionPlan:
+    """
+    Uses Groq to generate an initial execution strategy for the QA run.
+    """
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        # Fallback to a default plan if no API key
+        return ExecutionPlan(
+            rationale="No AI key detected. Falling back to standard heuristic plan.",
+            steps=[
+                PlanStep(agent="ingest", action="Parse source", expected_outcome="AST tree ready"),
+                PlanStep(agent="planner", action="Static analysis", expected_outcome="Risk profile generated")
+            ]
+        )
+
+    prompt = f"""
+    You are an AI QA Strategist.
+    Analyze this task and code to create a strategy.
+    
+    TASK: {task}
+    SOURCE CODE (Snippet):
+    {code[:1000]} 
+    """
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "llama-3.1-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"}
+                }
+            )
+            data = resp.json()
+            content = json.loads(data["choices"][0]["message"]["content"])
+            return ExecutionPlan(**content)
+    except Exception as e:
+        print(f"AI Planning Error (Using Fast Fallback): {e}")
+        return ExecutionPlan(
+            rationale="Fast Heuristic Analysis",
+            steps=[PlanStep(agent="ingest", action="Scan symbols", expected_outcome="Ready")]
+        )

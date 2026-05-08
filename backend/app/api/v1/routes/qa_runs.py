@@ -28,6 +28,7 @@ async def create_qa_run(
     service: QARunService = Depends(get_run_service),
     queue_service: JobQueueService = Depends(get_job_queue_service),
 ) -> dict:
+    print(f"📥 [API] POST /api/v1/qa-runs - Task: {task}")
     request = QARunCreate(
         task=task,
         validation_mode=validation_mode,
@@ -46,12 +47,12 @@ async def create_qa_run(
             (upload.filename or f"attachment_{index}", await upload.read()) for index, upload in enumerate(attachments or [])
         ],
     )
-    queue_result = await queue_service.enqueue_run(run.id)
-    if queue_result.dispatched:
-        await service.mark_run_dispatched(run.id, queue_result.mode, queue_result.detail)
-    else:
-        await service.mark_run_dispatched(run.id, queue_result.mode, queue_result.detail)
-        background_tasks.add_task(service.process_run, run.id)
+    
+    # INSTANT FIRE (Bypass everything for the demo)
+    import asyncio
+    print(f"🔥 [API] INSTANT START for {run.id}...")
+    asyncio.create_task(service.process_run(run.id))
+    
     return {"success": True, "data": run.model_dump(mode="json")}
 
 
