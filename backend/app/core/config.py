@@ -75,4 +75,6 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     settings = Settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    key_status = "FOUND" if settings.groq_api_key else "MISSING"
+    print(f"⚙️ [Config] Settings initialized. Groq API Key: {key_status} (starts with {str(settings.groq_api_key)[:6]}...)")
     return settings

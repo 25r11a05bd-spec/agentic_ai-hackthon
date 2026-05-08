@@ -6,11 +6,44 @@ import httpx
 
 from app.schemas.qa_run import WorkflowFinding, FailureExplanation, RepairStrategy
 
+def _extract_nested_json(data: Any, required_keys: list[str]) -> dict[str, Any]:
+    """
+    Recursively searches for a dictionary that contains most or all of the required keys.
+    """
+    if isinstance(data, dict):
+        # Flexible match: if it has at least one of the primary keys, consider it a candidate
+        if any(k in data for k in required_keys):
+            return data
+        for v in data.values():
+            found = _extract_nested_json(v, required_keys)
+            if found:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = _extract_nested_json(item, required_keys)
+            if found:
+                return found
+    return {}
+
+def _map_to_schema(data: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
+    """
+    Renames keys in a dictionary based on a mapping of common AI aliases.
+    """
+    new_data = data.copy()
+    for alias, target in mapping.items():
+        if alias in new_data and target not in new_data:
+            new_data[target] = new_data.pop(alias)
+    return new_data
+
 class AIPatch(BaseModel):
     explanation: str
     patch: str
     confidence: float
     is_safe: bool
+
+from app.core.config import get_settings
+
+settings = get_settings()
 
 async def generate_ai_reflection(
     code: str, 
@@ -20,12 +53,14 @@ async def generate_ai_reflection(
     """
     Uses LLM to generate a root cause analysis and explanation.
     """
-    # Using Groq or Ollama based on environment
-    api_key = os.getenv("GROQ_API_KEY")
-    model = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+    api_key = settings.groq_api_key
+    model = settings.groq_model
     base_url = "https://api.groq.com/openai/v1/chat/completions"
 
+    print(f"🤖 [AI-Reflection] Starting... Key present: {bool(api_key)}, Model: {model}")
+
     if not api_key:
+        print("⚠️ [AI-Reflection] Skipping AI reflection: GROQ_API_KEY is missing.")
         return None
 
     findings_text = "\n".join([f"- {f.severity.upper()}: {f.title} ({f.description})" for f in findings])
@@ -72,6 +107,18 @@ async def generate_ai_reflection(
             )
             data = resp.json()
             content = json.loads(data["choices"][0]["message"]["content"])
+
+            # Use recursive extractor for robustness
+            content = _extract_nested_json(content, ["root_cause", "evidence"]) or content
+            
+            # Map common aliases
+            content = _map_to_schema(content, {
+                "explanation": "root_cause",
+                "analysis": "root_cause",
+                "impact": "user_impact",
+                "fix": "recommended_fix"
+            })
+
             return FailureExplanation(**content)
     except Exception as e:
         print(f"AI Reflection Error: {e}")
@@ -85,7 +132,7 @@ async def generate_repair_strategies(
     """
     Generates actionable code patches using LLM, informed by past memories.
     """
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = settings.groq_api_key
     if not api_key:
         return []
 
@@ -125,7 +172,7 @@ async def generate_repair_strategies(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={
-                    "model": "llama-3.1-70b-versatile",
+                    "model": settings.groq_model,
                     "messages": [{"role": "user", "content": prompt}],
                     "response_format": {"type": "json_object"}
                 }
@@ -158,8 +205,13 @@ async def generate_plan(task: str, code: str) -> ExecutionPlan:
     """
     Uses Groq to generate an initial execution strategy for the QA run.
     """
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = settings.groq_api_key
+    model = settings.groq_model
+    
+    print(f"🤖 [AI-Planner] Starting... Key present: {bool(api_key)}, Model: {model}")
+
     if not api_key:
+        print("⚠️ [AI-Planner] Skipping AI planning: GROQ_API_KEY is missing. Using heuristic fallback.")
         # Fallback to a default plan if no API key
         return ExecutionPlan(
             rationale="No AI key detected. Falling back to standard heuristic plan.",
@@ -176,6 +228,18 @@ async def generate_plan(task: str, code: str) -> ExecutionPlan:
     TASK: {task}
     SOURCE CODE (Snippet):
     {code[:1000]} 
+
+    Return ONLY a JSON object with the following structure. DO NOT include any other text or keys.
+    {{
+        "rationale": "...",
+        "steps": [
+            {{
+                "agent": "...",
+                "action": "...",
+                "expected_outcome": "..."
+            }}
+        ]
+    }}
     """
 
     try:
@@ -184,13 +248,38 @@ async def generate_plan(task: str, code: str) -> ExecutionPlan:
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={
-                    "model": "llama-3.1-70b-versatile",
+                    "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "response_format": {"type": "json_object"}
                 }
             )
             data = resp.json()
-            content = json.loads(data["choices"][0]["message"]["content"])
+            raw_content = data["choices"][0]["message"]["content"]
+            print(f"🤖 [AI-Planner] Raw Response: {raw_content[:200]}...")
+            content = json.loads(raw_content)
+            
+            # Use recursive extractor for robustness
+            content = _extract_nested_json(content, ["rationale", "steps"]) or content
+            
+            # Map common aliases for Planner
+            content = _map_to_schema(content, {
+                "strategy": "rationale",
+                "analysis": "rationale",
+                "plan": "steps",
+                "execution_plan": "steps",
+                "actions": "steps"
+            })
+
+            # Ensure steps is a list of objects, not strings
+            if "steps" in content and isinstance(content["steps"], list):
+                processed_steps = []
+                for s in content["steps"]:
+                    if isinstance(s, str):
+                        processed_steps.append({"agent": "planner", "action": s, "expected_outcome": "Unknown"})
+                    else:
+                        processed_steps.append(s)
+                content["steps"] = processed_steps
+
             return ExecutionPlan(**content)
     except Exception as e:
         print(f"AI Planning Error (Using Fast Fallback): {e}")

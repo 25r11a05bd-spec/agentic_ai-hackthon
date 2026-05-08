@@ -396,11 +396,12 @@ def inspect_workflow(raw_workflow: dict[str, Any], workflow: CanonicalWorkflowSp
 
 def score_workflow_quality(findings: list[WorkflowFinding]) -> QualityScores:
     # Severity weights for exponential decay
+    # Severity weights for exponential decay - made significantly harsher
     severity_factors = {
-        "critical": 0.40, 
-        "high": 0.15,
-        "medium": 0.05,
-        "low": 0.02,
+        "critical": 0.70, # 70% drop
+        "high": 0.40,     # 40% drop
+        "medium": 0.15,   # 15% drop
+        "low": 0.05,      # 5% drop
         "info": 0.00
     }
     
@@ -412,7 +413,7 @@ def score_workflow_quality(findings: list[WorkflowFinding]) -> QualityScores:
         cat_findings = [f for f in findings if f.category == cat]
         score = 100.0
         for f in cat_findings:
-            factor = severity_factors.get(f.severity, 0.05)
+            factor = severity_factors.get(f.severity, 0.15)
             score *= (1.0 - factor)
         category_scores[cat] = round(score)
 
@@ -422,13 +423,17 @@ def score_workflow_quality(findings: list[WorkflowFinding]) -> QualityScores:
     hallucination_risk = 100 - hallucination_score
     retry_health = category_scores["resilience"]
     
-    # Reliability is driven by static, runtime, control_flow and security health
-    reliability = round((category_scores["static_analysis"] + category_scores["runtime_execution"] + category_scores["control_flow"] + category_scores["security"]) / 4)
+    # Reliability is driven by security (weighted heavily), static, runtime, and control_flow
+    # Security is now a critical multiplier for reliability
+    security_factor = category_scores["security"] / 100.0
+    reliability_base = (category_scores["static_analysis"] + category_scores["runtime_execution"] + category_scores["control_flow"]) / 3
+    reliability = round(reliability_base * security_factor)
     
-    # Weighted Blend: Reliability(40%) + Validation(30%) + Grounding(20%) + Resilience(10%)
+    # Weighted Blend: Reliability(50%) + Validation(20%) + Grounding(20%) + Resilience(10%)
+    # Higher weight on Reliability/Security to ensure "86" doesn't happen with critical bugs
     overall = round(
-        (reliability * 0.4) + 
-        (validation * 0.3) + 
+        (reliability * 0.5) + 
+        (validation * 0.2) + 
         (hallucination_score * 0.2) + 
         (retry_health * 0.1)
     )

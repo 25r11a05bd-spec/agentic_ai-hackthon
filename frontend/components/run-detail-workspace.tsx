@@ -77,21 +77,47 @@ export function RunDetailWorkspace({
 
   useEffect(() => {
     const socket = new WebSocket(`${WS_BASE}/ws/qa-runs/${run.id}`);
+    
     socket.onmessage = (message) => {
-      const payload = JSON.parse(message.data) as PlaybackEvent & { event_type?: string };
+      const payload = JSON.parse(message.data) as PlaybackEvent & { event_type?: string; payload?: any };
+      
       if (!payload.event_type || payload.event_type === "heartbeat") {
         return;
       }
+
+      // 1. Update events list
       setEvents((current) => {
         if (current.some((item) => item.id === payload.id)) {
           return current;
         }
-        return [...current, payload];
+        const updated = [...current, payload];
+        // 2. Auto-advance active index to the latest event
+        setActiveIndex(updated.length - 1);
+        return updated;
       });
-      setActiveIndex((current) => Math.max(current, events.length));
+
+      // 3. Update run status or current agent if relevant event received
+      if (payload.event_type === "run_completed" || payload.event_type === "run_failed") {
+        setCurrentRun((prev) => ({
+          ...prev,
+          status: payload.status as any,
+          scores: payload.payload?.scores || prev.scores,
+          risk_level: payload.payload?.risk_level || prev.risk_level,
+        }));
+      } else if (payload.event_type === "node_transition") {
+        setCurrentRun((prev) => ({
+          ...prev,
+          current_agent: payload.agent
+        }));
+      }
     };
-    return () => socket.close();
-  }, [run.id, events.length]);
+
+    return () => {
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.close();
+      }
+    };
+  }, [run.id]); // Removed events.length to prevent re-mounting loop
 
   const activeEvent = events[Math.min(activeIndex, Math.max(events.length - 1, 0))];
 

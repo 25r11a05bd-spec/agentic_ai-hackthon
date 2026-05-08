@@ -15,7 +15,7 @@ import traceback
 from pathlib import Path
 
 def run_harness():
-    results = {{"init_success": False, "routes": []}}
+    results = {"init_success": False, "routes": []}
     try:
         # Import the user code
         import app as user_app
