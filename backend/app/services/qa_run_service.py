@@ -26,16 +26,18 @@ from app.schemas.qa_run import (
     RetryRequest,
     RunArtifact,
     WorkflowFinding,
+    QualityReportSummary,
+    QualityScores
 )
 from app.services.memory_runtime import rank_repair_strategies, retrieve_memory, save_failure_patterns, store_memory
 from app.services.job_queue import JobQueueService
 from app.services.notification_service import NotificationService
 from app.services.reporting import generate_markdown_report, generate_pdf_report
 from app.tools.api_validation import inspect_response, retry_request
-from app.tools.python_analysis import analyze_python_code, generate_quality_report
+from app.tools.python_analysis import analyze_python_code, generate_quality_report, generate_ai_code_review
 from app.tools.workflow_validation import detect_hallucinations, inspect_workflow, normalize_workflow, validate_json
 from app.tools.sandbox import run_in_sandbox, analyze_sandbox_result
-from app.tools.ai_agent import generate_ai_reflection, generate_repair_strategies, generate_plan
+from app.tools.ai_agent import generate_ai_reflection, generate_repair_strategies, generate_plan, generate_ai_quality_analysis
 from app.utils.time import utcnow
 from app.workflows.runtime import EXECUTION_NODE_IDS, build_execution_graph
 
@@ -146,8 +148,10 @@ class QARunService:
         )
 
     async def process_run(self, run_id: str) -> None:
+        print(f"🔥 [Service] process_run START for {run_id}")
         # Give the UI/WebSocket a moment to settle
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.0)
+        print(f"🔥 [Service] process_run Proceeding after sleep...")
         
         try:
             run = await self._require_run(run_id)
@@ -166,13 +170,18 @@ class QARunService:
             collaboration.append(self._collaboration_step(run_id, "ingest", ["file_loader"], "Stored uploaded artifacts."))
 
             # --- PLANNER ---
+            print(f"🟢 [Run {run_id}] Phase: PLANNER - Starting...")
             await self._transition_node(run_id, "planner", node_status_map)
-            ai_plan = await generate_plan(run.task, source)
-            print(f"🧠 [Planner] AI Strategy: {ai_plan.rationale}")
             
+            print(f"🟢 [Run {run_id}] Calling AI Planner...")
+            ai_plan = await generate_plan(run.task, source)
+            print(f"🧠 [Planner] AI Strategy: {ai_plan.rationale[:100]}...")
+            
+            print(f"🟢 [Run {run_id}] Running Static Analysis...")
             python_analysis = analyze_python_code(source)
             workflow = normalize_workflow(raw_workflow)
             
+            print(f"🟢 [Run {run_id}] Updating repository with plan...")
             await self._repository.update_run(
                 run_id, 
                 latest_state={
@@ -201,14 +210,17 @@ class QARunService:
             collaboration.append(self._collaboration_step(run_id, "planner", ["analyze_python_code", "normalize_workflow"], python_analysis.ast_summary, confidence=0.84))
 
             # --- TOOL ROUTER ---
+            print(f"🟢 [Run {run_id}] Phase: TOOL_ROUTER - Starting...")
             await self._transition_node(run_id, "tool_router", node_status_map)
             selected_tools = ["inspect_workflow", "detect_hallucinations"]
             if workflow.api_calls:
                 selected_tools.append("validate_api")
+            print(f"🟢 [Run {run_id}] Selected tools: {selected_tools}")
             await self._emit(run_id, "agent_log", "tool_router", "Selected validation and probe tools", "success", payload={"tools": selected_tools, "api_calls": workflow.api_calls})
             collaboration.append(self._collaboration_step(run_id, "tool_router", selected_tools, f"Selected {len(selected_tools)} tools for this run.", confidence=0.79, dependencies=["planner"]))
             
             # --- EXECUTOR ---
+            print(f"🟢 [Run {run_id}] Phase: EXECUTOR - Starting...")
             await self._transition_node(run_id, "executor", node_status_map)
             findings = list(static_findings)
             sandbox_result: dict[str, Any] = {}
@@ -258,11 +270,28 @@ class QARunService:
             collaboration.append(self._collaboration_step(run_id, "executor", selected_tools, f"Generated {len(findings)} findings from workflow inspection and probes.", risk_level="medium" if findings else "low", confidence=0.77, dependencies=["tool_router"]))
 
             # --- VALIDATOR ---
+            print(f"🟢 [Run {run_id}] Phase: VALIDATOR - Starting...")
             await self._repository.replace_findings(run_id, findings)
             await self._transition_node(run_id, "validator", node_status_map)
             scores = self._score_with_context(findings)
             risk_level = self._risk_level(scores, findings)
-            quality_summary = generate_quality_report(run_id, "running", scores, findings)
+            
+            # AI-Powered Quality Analysis (Overwrites static summary if key present)
+            ai_quality = await generate_ai_quality_analysis(run_id, source, findings, scores)
+            if ai_quality:
+                print(f"🤖 [Validator] AI Analysis complete. Adjusted Overall: {ai_quality.scores.overall}")
+                scores = ai_quality.scores
+                quality_summary = QualityReportSummary(
+                    run_id=run_id,
+                    status="running",
+                    generated_at=utcnow(),
+                    summary=ai_quality.summary,
+                    scores=scores,
+                    finding_counts={f.severity: findings.count(f) for f in findings},
+                    top_risks=ai_quality.top_risks
+                )
+            else:
+                quality_summary = generate_quality_report(run_id, "running", scores, findings)
             
             # Lenient validation for demo: allow high severity findings if overall score is still decent
             validation_passed = (
@@ -294,6 +323,7 @@ class QARunService:
             await self._transition_node(run_id, "failure_explainer", node_status_map)
             if findings:
                 print(f"🤖 [AI] Starting AI reflection for {len(findings)} findings...")
+                await self._transition_node(run_id, "reflection", node_status_map)
                 try:
                     # Safely handle missing sandbox logs
                     logs = (sandbox_result.get("stdout") or "") + "\n" + (sandbox_result.get("stderr") or "")
@@ -311,11 +341,49 @@ class QARunService:
                     print(f"⚠️ [Failure Explainer] Logic failed: {e}")
 
                 try:
-                    await self._transition_node(run_id, "repair_strategy", node_status_map)
-                    repair_strategies = self._build_repair_strategies(findings, workflow.api_calls or [])
+                    await self._transition_node(run_id, "memory_retriever", node_status_map)
+                    print(f"🧠 [Memory] Retrieving past failure patterns from ChromaDB...")
+                    
+                    past_memories = await retrieve_memory(self._memory_service, "repair_strategy_memories", failure_explanation.root_cause if failure_explanation else "Fix this bug", limit=3)
+                    
+                    if past_memories:
+                        print(f"✅ [Memory] Found {len(past_memories)} past fixes in ChromaDB!")
+                        await self._emit(run_id, "agent_log", "memory_retriever", f"Retrieved {len(past_memories)} past fixes.", "success", payload={"memories": len(past_memories)})
+                        collaboration.append(self._collaboration_step(run_id, "memory_retriever", ["retrieve_memory"], f"Retrieved {len(past_memories)} past fixes from memory.", confidence=0.9, dependencies=["reflection"]))
+                    else:
+                        print(f"ℹ️ [Memory] No relevant past fixes found.")
+                        await self._emit(run_id, "agent_log", "memory_retriever", "No relevant past fixes found in memory.", "success")
+                except Exception as e:
+                    print(f"⚠️ [Memory Retriever] Logic failed: {e}")
+                    past_memories = []
+
+                try:
+                    await self._transition_node(run_id, "self_heal_router", node_status_map)
+                    print(f"🤖 [AI] Generating AI Repair Strategies...")
+                    
+                    # Convert memories to strings for the AI agent
+                    memory_texts = [m.get("document", "") for m in past_memories] if past_memories else []
+                    repair_strategies = await generate_repair_strategies(source, findings, memory_texts)
+                    
+                    # Fallback if AI fails or returns empty
+                    if not repair_strategies:
+                        print("⚠️ [AI] AI Repair failed or returned empty. Using heuristic fallback.")
+                        repair_strategies = self._build_repair_strategies(findings, workflow.api_calls or [])
+                    
+                    # Adaptive Memory Ranking
+                    if past_memories and repair_strategies:
+                        print(f"🧠 [Memory] Ranking {len(repair_strategies)} strategies against past memory successes...")
+                        repair_strategies = rank_repair_strategies(
+                            candidates=repair_strategies,
+                            retrieved_memories=past_memories,
+                            min_similarity=0.4,
+                            max_strategies=3
+                        )
+                        print(f"✅ [Memory] Ranking complete. Best strategy: {repair_strategies[0].title if repair_strategies else 'None'}")
+                    
                     await self._repository.save_repair_strategies(run_id, repair_strategies)
-                    await self._emit(run_id, "repairs_proposed", "repair_strategy", f"Proposed {len(repair_strategies)} fixes", "success", payload={"strategies": [s.model_dump() for s in repair_strategies]})
-                    collaboration.append(self._collaboration_step(run_id, "repair_strategy", ["build_repair_strategies"], f"Found {len(repair_strategies)} remediation vectors.", confidence=0.75, dependencies=["failure_explainer"]))
+                    await self._emit(run_id, "repairs_proposed", "self_heal_router", f"Proposed {len(repair_strategies)} fixes", "success", payload={"strategies": [s.model_dump() for s in repair_strategies]})
+                    collaboration.append(self._collaboration_step(run_id, "self_heal_router", ["generate_repair_strategies"], f"Found {len(repair_strategies)} remediation vectors.", confidence=0.75, dependencies=["failure_explainer"]))
                 except Exception as e:
                     print(f"⚠️ [Repair Strategy] Logic failed: {e}")
 
@@ -326,10 +394,40 @@ class QARunService:
             except Exception as e:
                 print(f"⚠️ [Memory Writer] Failed (Non-critical): {e}")
 
+            # --- AUTONOMOUS SELF-HEALING LOOP ---
+            await self._transition_node(run_id, "retry_or_replan", node_status_map)
+            if repair_strategies and run.retry_enabled and run.retries_used < run.max_retries:
+                best_strategy = repair_strategies[0]
+                if best_strategy.fixed_code:
+                    print(f"🔄 [Run {run_id}] Applying Self-Healing Patch and Looping back to Start...")
+                    
+                    # Overwrite the source file
+                    project_path = Path(run.latest_state["project_path"])
+                    project_path.write_text(best_strategy.fixed_code, encoding="utf-8")
+                    
+                    # Update retries
+                    await self._repository.update_run(run_id, retries_used=run.retries_used + 1)
+                    
+                    # Keep status map so UI knows we visited these nodes in previous cycles
+                    await self._transition_node(run_id, "ingest", node_status_map)
+                    
+                    # Emit a special log
+                    await self._emit(run_id, "agent_log", "ingest", f"Self-Heal Loop {run.retries_used + 1}/{run.max_retries} initiated. Applied patch: {best_strategy.title}", "success")
+                    
+                    # Recursively run the entire pipeline again
+                    return await self.process_run(run_id)
+
             # --- FINALIZER ---
             try:
+                print(f"🟢 [Run {run_id}] Phase: FINALIZER - Starting...")
                 await self._transition_node(run_id, "finalizer", node_status_map)
                 detail = await self._require_run(run_id)
+                
+                # Final touch: Add qualitative AI review to the metadata if not already there
+                ai_review = await generate_ai_code_review(source)
+                if quality_summary:
+                    quality_summary.summary += f"\n\n### AI Code Review\n{ai_review}"
+                
                 markdown = generate_markdown_report(detail, quality_summary, failure_explanation)
                 
                 # Fail-safe PDF
@@ -347,6 +445,10 @@ class QARunService:
                 node_status_map["finalizer"] = "completed"
             except Exception as e:
                 print(f"⚠️ [Finalizer] Logic failed: {e}")
+
+            # --- APPROVAL & NOTIFICATIONS ---
+            await self._transition_node(run_id, "approval_gate", node_status_map)
+            await self._transition_node(run_id, "notifier", node_status_map)
 
             # FINAL STATE COMMIT
             await self._repository.update_run(
@@ -498,11 +600,16 @@ class QARunService:
             timestamp=utcnow(),
         )
         saved = await self._repository.add_event(event)
-        await self._websocket_manager.broadcast(run_id, saved.model_dump(mode="json"))
+        try:
+            # Wrap in try/except to prevent WS issues from hanging the engine
+            await self._websocket_manager.broadcast(run_id, saved.model_dump(mode="json"))
+        except Exception as e:
+            print(f"⚠️ [WS-Warning] Broadcast failed for {run_id}: {e}")
         return saved
 
     async def _transition_node(self, run_id: str, node_id: str, status_map: dict[str, str]) -> None:
         """Transitions a node to 'running' and updates the status map."""
+        print(f"📡 [DB-Pulse] Transitioning {run_id} to {node_id}...")
         # Mark previous running node as completed
         for k, v in status_map.items():
             if v == "running":
@@ -511,11 +618,15 @@ class QARunService:
         status_map[node_id] = "running"
         
         # PERSIST IMMEDIATELY so the UI reflects progress
-        await self._repository.update_run(
-            run_id, 
-            current_agent=node_id,
-            latest_state={"node_status_map": status_map}
-        )
+        try:
+            await self._repository.update_run(
+                run_id, 
+                current_agent=node_id,
+                latest_state={"node_status_map": status_map}
+            )
+            print(f"📡 [DB-Pulse] Repository updated.")
+        except Exception as e:
+            print(f"❌ [DB-Error] Failed to update run status: {e}")
         
         await self._emit(run_id, "node_transition", node_id, f"Agent {node_id} active", "running")
         snapshot = PlaybackSnapshot(

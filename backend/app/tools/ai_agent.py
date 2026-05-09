@@ -4,7 +4,7 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import httpx
 
-from app.schemas.qa_run import WorkflowFinding, FailureExplanation, RepairStrategy
+from app.schemas.qa_run import WorkflowFinding, FailureExplanation, RepairStrategy, QualityScores
 
 def _extract_nested_json(data: Any, required_keys: list[str]) -> dict[str, Any]:
     """
@@ -71,7 +71,7 @@ async def generate_ai_reflection(
     
     SOURCE CODE:
     ```python
-    {code}
+    {code[:2000]}
     ```
     
     FINDINGS:
@@ -142,9 +142,14 @@ async def generate_repair_strategies(
     You are an AI Self-Healing System.
     Generate 2-3 specific code repair strategies for these findings.
     
+    CRITICAL PRIORITIES:
+    1. If there is an 'Application Initialization Failure' or import crash (e.g. missing SECRET_TOKEN), you MUST prioritize fixing the Python code by injecting safe fallbacks like `os.getenv("SECRET_TOKEN", "")`.
+    2. Fix actual Python syntax errors, division by zero, or type errors BEFORE suggesting workflow-level retry optimizations.
+    3. Always output the COMPLETE `fixed_code` so the engine can apply it directly.
+    
     SOURCE CODE:
     ```python
-    {code}
+    {code[:2000]}
     ```
 
     LEARNED PATTERNS (FROM PAST SUCCESSFUL FIXES):
@@ -178,6 +183,9 @@ async def generate_repair_strategies(
                 }
             )
             data = resp.json()
+            if "choices" not in data:
+                print(f"❌ [AI-Repair] Groq Error: {data.get('error', 'Unknown Error')}")
+                return []
             content = json.loads(data["choices"][0]["message"]["content"])
             items = content.get("strategies", [])
             
@@ -189,7 +197,14 @@ async def generate_repair_strategies(
                 strategies.append(RepairStrategy(**item))
             return strategies
     except Exception as e:
-        print(f"AI Repair Error: {e}")
+        if 'resp' in locals() and hasattr(resp, 'json'):
+            try:
+                err_data = resp.json()
+                print(f"❌ [AI-Repair] Groq API Error: {err_data.get('error', e)}")
+            except:
+                print(f"❌ [AI-Repair] Error: {e}")
+        else:
+            print(f"❌ [AI-Repair] Error: {e}")
         return []
 
 class PlanStep(BaseModel):
@@ -243,7 +258,7 @@ async def generate_plan(task: str, code: str) -> ExecutionPlan:
     """
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -254,6 +269,10 @@ async def generate_plan(task: str, code: str) -> ExecutionPlan:
                 }
             )
             data = resp.json()
+            if "choices" not in data:
+                print(f"❌ [AI-Planner] Groq Error: {data.get('error', 'Unknown')}")
+                raise ValueError(f"Groq API Error: {data.get('error', 'Unknown')}")
+                
             raw_content = data["choices"][0]["message"]["content"]
             print(f"🤖 [AI-Planner] Raw Response: {raw_content[:200]}...")
             content = json.loads(raw_content)
@@ -287,3 +306,74 @@ async def generate_plan(task: str, code: str) -> ExecutionPlan:
             rationale="Fast Heuristic Analysis",
             steps=[PlanStep(agent="ingest", action="Scan symbols", expected_outcome="Ready")]
         )
+
+class AIQualityAnalysis(BaseModel):
+    summary: str
+    scores: QualityScores
+    top_risks: list[str]
+    recommendation: str
+
+async def generate_ai_quality_analysis(
+    run_id: str,
+    code: str,
+    findings: List[WorkflowFinding],
+    static_scores: QualityScores
+) -> Optional[AIQualityAnalysis]:
+    """
+    Uses LLM to provide a final qualitative judgment and adjusted scoring.
+    """
+    api_key = settings.groq_api_key
+    if not api_key:
+        return None
+
+    findings_text = "\n".join([f"- {f.severity.upper()}: {f.title} ({f.description})" for f in findings])
+    
+    prompt = f"""
+    You are an AI QA Auditor.
+    Evaluate this QA Run and provide a final quality judgment.
+    
+    RUN ID: {run_id}
+    SOURCE CODE:
+    ```python
+    {code[:1500]}
+    ```
+    
+    FINDINGS:
+    {findings_text}
+    
+    STATIC SCORES:
+    {json.dumps(static_scores.model_dump(), indent=2)}
+    
+    Provide an adjusted score and a professional summary.
+    Return JSON:
+    {{
+        "summary": "Professional executive summary of the code quality",
+        "scores": {{
+            "reliability": 0-100,
+            "validation": 0-100,
+            "hallucination_risk": 0-100,
+            "retry_health": 0-100,
+            "overall": 0-100
+        }},
+        "top_risks": ["risk 1", "risk 2"],
+        "recommendation": "Primary next step for the developer"
+    }}
+    """
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": settings.groq_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"}
+                }
+            )
+            data = resp.json()
+            content = json.loads(data["choices"][0]["message"]["content"])
+            return AIQualityAnalysis(**content)
+    except Exception as e:
+        print(f"AI Quality Analysis Error: {e}")
+        return None

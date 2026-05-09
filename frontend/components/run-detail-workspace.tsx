@@ -32,6 +32,7 @@ const PIPELINE_STEPS = [
   { key: "executor",  label: "Executing",          icon: "⚙️" },
   { key: "validator", label: "Validating",         icon: "🔍" },
   { key: "reflection",label: "Error Correction",   icon: "🔧" },
+  { key: "memory_retriever", label: "Memory Retrieval", icon: "📚" },
   { key: "finalizer", label: "Generating Report",  icon: "📄" },
 ];
 
@@ -39,7 +40,7 @@ function getStepStatus(key: string, events: PlaybackEvent[], currentAgent: strin
   const relevantEvents = events.filter(
     (e) => e.agent === key || e.step?.toLowerCase().includes(key)
   );
-  if (relevantEvents.some((e) => e.status === "completed")) return "completed";
+  if (relevantEvents.some((e) => ["completed", "success", "failed"].includes(e.status))) return "completed";
   if (relevantEvents.some((e) => e.status === "error")) return "error";
   if (currentAgent === key) return "running";
   const stepIndex = PIPELINE_STEPS.findIndex((s) => s.key === key);

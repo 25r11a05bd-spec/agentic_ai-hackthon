@@ -75,6 +75,12 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     settings = Settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    key_status = "FOUND" if settings.groq_api_key else "MISSING"
-    print(f"⚙️ [Config] Settings initialized. Groq API Key: {key_status} (starts with {str(settings.groq_api_key)[:6]}...)")
+    
+    if not settings.groq_api_key:
+        print("❌ [CRITICAL] GROQ_API_KEY is missing from environment/env file!")
+        print("💡 The app will use limited HEURISTIC FALLBACKS for all AI agents. Groq Dashboard calls will be 0.")
+    else:
+        print(f"🚀 [Config] Groq API Key detected (starts with {str(settings.groq_api_key)[:7]}...)")
+        print(f"🤖 [Config] Primary AI Provider: {settings.ai_provider_primary} | Model: {settings.groq_model}")
+        
     return settings

@@ -11,6 +11,7 @@ EXECUTION_NODE_IDS = [
     "validator",
     "failure_explainer",
     "reflection",
+    "memory_retriever",
     "self_heal_router",
     "retry_or_replan",
     "approval_gate",

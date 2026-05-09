@@ -171,3 +171,32 @@ def generate_quality_report(
         finding_counts=finding_counts,
         top_risks=top_risks,
     )
+
+async def generate_ai_code_review(source: str) -> str:
+    """
+    Optional qualitative review using Groq.
+    """
+    from app.core.config import get_settings
+    import httpx
+    import json
+    
+    settings = get_settings()
+    api_key = settings.groq_api_key
+    if not api_key:
+        return "AI Review skipped: No API Key."
+
+    prompt = f"Review this Python code for logic errors and suggest improvements:\n\n{source[:2000]}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": settings.groq_model,
+                    "messages": [{"role": "user", "content": prompt}]
+                }
+            )
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"AI Review Error: {e}"

@@ -33,7 +33,7 @@ class PlaybackWebSocketManager:
         stale: list[WebSocket] = []
         for socket in sockets:
             try:
-                await socket.send_json(payload)
+                await asyncio.wait_for(socket.send_json(payload), timeout=1.0)
             except Exception:
                 stale.append(socket)
 
