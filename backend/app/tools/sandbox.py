@@ -17,6 +17,12 @@ from pathlib import Path
 def run_harness():
     results = {"init_success": False, "routes": []}
     try:
+        # Mock environment variables to prevent initialization crashes
+        import os
+        os.environ.setdefault("SECRET_TOKEN", "mock_token_for_testing")
+        os.environ.setdefault("API_KEY", "mock_api_key")
+        os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
+        
         # Import the user code
         import app as user_app
         results["init_success"] = True

@@ -62,7 +62,8 @@ class Settings(BaseSettings):
     approval_hallucination_threshold: int = 50
     websocket_heartbeat_seconds: int = 3
 
-    data_dir: Path = Field(default_factory=lambda: BASE_DIR / "storage")
+    # Move storage outside of the backend/ package to prevent uvicorn --reload loops
+    data_dir: Path = Field(default_factory=lambda: BASE_DIR.parent / "storage")
 
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",

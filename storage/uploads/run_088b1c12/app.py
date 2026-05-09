@@ -1,0 +1,1 @@
+try:\n\tresult = 1 \nexcept ZeroDivisionError:\n\treturn {'error': 'Cannot divide by zero'}\nexcept Exception as e:\n\treturn {'error': repr(e)}\n; time.sleep(0); pass

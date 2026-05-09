@@ -332,7 +332,25 @@ def inspect_workflow(raw_workflow: dict[str, Any], workflow: CanonicalWorkflowSp
     
     # Cycle Detection
     cycles = _check_cycles(workflow.nodes, workflow.edges)
+    
+    # Check for specific finalizer -> planner cycle
+    finalizer_cycle = any(
+        edge.source.lower() == "finalizer" and edge.target.lower() == "planner"
+        for edge in workflow.edges
+    )
+    if finalizer_cycle:
+        findings.append(WorkflowFinding(
+            category="control_flow",
+            severity="critical",
+            title="Fatal Cycle: Finalizer to Planner",
+            description="Detected a fatal structural cycle where the finalizer loops back to the planner, causing an infinite loop in the agent workflow.",
+            affected_nodes=["finalizer", "planner"],
+            recommendation="Remove the edge from finalizer to planner. The finalizer must be a terminal node."
+        ))
+        
     for node_id in cycles:
+        if finalizer_cycle and node_id in ["finalizer", "planner"]:
+            continue
         findings.append(WorkflowFinding(
             category="control_flow",
             severity="high",
@@ -395,12 +413,11 @@ def inspect_workflow(raw_workflow: dict[str, Any], workflow: CanonicalWorkflowSp
 
 
 def score_workflow_quality(findings: list[WorkflowFinding]) -> QualityScores:
-    # Severity weights for exponential decay
     # Severity weights for exponential decay - made significantly harsher
     severity_factors = {
-        "critical": 0.70, # 70% drop
-        "high": 0.40,     # 40% drop
-        "medium": 0.15,   # 15% drop
+        "critical": 0.85, # 85% drop
+        "high": 0.50,     # 50% drop
+        "medium": 0.20,   # 20% drop
         "low": 0.05,      # 5% drop
         "info": 0.00
     }
@@ -421,16 +438,18 @@ def score_workflow_quality(findings: list[WorkflowFinding]) -> QualityScores:
     validation = category_scores["validation"]
     hallucination_score = category_scores["hallucination"]
     hallucination_risk = 100 - hallucination_score
-    retry_health = category_scores["resilience"]
     
-    # Reliability is driven by security (weighted heavily), static, runtime, and control_flow
-    # Security is now a critical multiplier for reliability
-    security_factor = category_scores["security"] / 100.0
+    # Resilience is heavily impacted by runtime crashes and control flow issues
+    runtime_penalty = (100 - category_scores["runtime_execution"]) / 100.0
+    control_flow_penalty = (100 - category_scores["control_flow"]) / 100.0
+    retry_health = category_scores["resilience"] * (1.0 - runtime_penalty * 0.5) * (1.0 - control_flow_penalty * 0.3)
+    retry_health = round(retry_health)
+    
+    # Reliability is driven by static, runtime, control_flow
     reliability_base = (category_scores["static_analysis"] + category_scores["runtime_execution"] + category_scores["control_flow"]) / 3
-    reliability = round(reliability_base * security_factor)
+    reliability = round(reliability_base)
     
-    # Weighted Blend: Reliability(50%) + Validation(20%) + Grounding(20%) + Resilience(10%)
-    # Higher weight on Reliability/Security to ensure "86" doesn't happen with critical bugs
+    # Weighted Blend
     overall = round(
         (reliability * 0.5) + 
         (validation * 0.2) + 
@@ -438,6 +457,16 @@ def score_workflow_quality(findings: list[WorkflowFinding]) -> QualityScores:
         (retry_health * 0.1)
     )
     
+    # HARD CAPS FOR SECURITY & FATAL ERRORS
+    if any(f.severity == "critical" for f in findings):
+        overall = min(overall, 30)
+        reliability = min(reliability, 20)
+        retry_health = min(retry_health, 40)
+    elif any(f.severity == "high" for f in findings):
+        overall = min(overall, 55)
+        reliability = min(reliability, 45)
+        retry_health = min(retry_health, 60)
+        
     return QualityScores(
         reliability=reliability,
         validation=validation,

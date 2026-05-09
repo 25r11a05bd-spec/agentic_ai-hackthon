@@ -6,7 +6,7 @@ from app.schemas.qa_run import PythonAnalysis, QualityReportSummary, QualityScor
 from app.utils.time import utcnow
 
 HTTP_CLIENT_IMPORTS = {"requests", "httpx", "aiohttp"}
-UNSAFE_CALLS = {"exec", "eval", "os.system", "subprocess.run", "subprocess.Popen"}
+UNSAFE_CALLS = {"exec", "eval", "os.system", "subprocess.run", "subprocess.Popen", "subprocess.check_output"}
 
 class SecurityVisitor(ast.NodeVisitor):
     def __init__(self):
@@ -64,6 +64,9 @@ class SecurityVisitor(ast.NodeVisitor):
             elif isinstance(sub_node, (ast.With, ast.AsyncWith)):
                 for item in sub_node.items:
                     if item.optional_vars: self._add_target(item.optional_vars)
+            elif isinstance(sub_node, ast.ExceptHandler):
+                if sub_node.name:
+                    self.defined_names.add(sub_node.name)
         
         if node.name.startswith(("validate_", "check_", "guard_")):
             self.validators.append(node.name)
@@ -90,17 +93,54 @@ class SecurityVisitor(ast.NodeVisitor):
 
         if func_name in UNSAFE_CALLS:
             self.findings.append(f"CRITICAL SECURITY RISK: Unsafe call detected: {func_name}")
+            
+        if func_name == "yaml.load":
+            self.findings.append("CRITICAL SECURITY RISK: Unsafe YAML Deserialization detected via yaml.load")
+            
+        if func_name == "os.remove":
+            self.findings.append("CRITICAL SECURITY RISK: Arbitrary File Deletion detected via os.remove")
 
         if func_name == "open" and node.args:
+            mode = "r"
+            if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                mode = node.args[1].value
+            elif len(node.args) > 1 and hasattr(node.args[1], "s"):
+                mode = node.args[1].s
+            
             first_arg = node.args[0]
-            if isinstance(first_arg, ast.Name):
-                self.findings.append(f"HIGH SECURITY RISK: Potential Path Traversal in 'open()' with dynamic variable '{first_arg.id}'")
+            is_dynamic = not isinstance(first_arg, ast.Constant) and not hasattr(first_arg, "s")
+            
+            if is_dynamic:
+                if "w" in mode or "a" in mode:
+                    self.findings.append("HIGH SECURITY RISK: Arbitrary File Write / Unsafe Upload Path Construction")
+                else:
+                    self.findings.append(f"HIGH SECURITY RISK: Potential Path Traversal in 'open()'")
 
         if isinstance(node.func, ast.Attribute):
             owner = getattr(node.func.value, "id", "")
             if owner in {"requests", "httpx", "client", "session"} and node.func.attr in {"get", "post", "put", "delete"}:
                 self.api_calls.append(node.func.attr)
+                if node.args and not isinstance(node.args[0], ast.Constant) and not hasattr(node.args[0], "s"):
+                    self.findings.append(f"HIGH SECURITY RISK: SSRF vulnerability detected in {owner}.{node.func.attr}()")
 
+        self.generic_visit(node)
+        
+    def visit_JoinedStr(self, node):
+        text = ""
+        has_dynamic = False
+        for value in node.values:
+            if isinstance(value, ast.Constant):
+                text += str(value.value)
+            elif hasattr(value, "s"):
+                text += str(value.s)
+            elif isinstance(value, ast.FormattedValue):
+                has_dynamic = True
+                text += "{VAR}"
+        
+        text_upper = text.upper()
+        if has_dynamic and any(k in text_upper for k in ["SELECT *", "SELECT ", "UPDATE ", "INSERT ", "DELETE "]) and (" FROM " in text_upper or " INTO " in text_upper or " TABLE " in text_upper):
+            self.findings.append("CRITICAL SECURITY RISK: SQL Injection detected in dynamic query string")
+            
         self.generic_visit(node)
 
 def analyze_python_code(source: str) -> PythonAnalysis:
@@ -118,9 +158,14 @@ def analyze_python_code(source: str) -> PythonAnalysis:
                 for t in targets: visitor._add_target(t)
             elif isinstance(node, ast.ClassDef):
                 visitor.defined_names.add(node.name)
-            elif isinstance(node, (ast.For, ast.With)):
-                # Handle top-level loops/withs
-                pass 
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                visitor._add_target(node.target)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars: visitor._add_target(item.optional_vars)
+            elif isinstance(node, ast.ExceptHandler):
+                if node.name:
+                    visitor.defined_names.add(node.name) 
 
         visitor.visit(tree)
     except SyntaxError as e:
@@ -138,6 +183,7 @@ def analyze_python_code(source: str) -> PythonAnalysis:
         classes=sorted(set(visitor.classes)),
         api_calls=sorted(set(visitor.api_calls)),
         validators=sorted(set(visitor.validators)),
+        undefined_symbols=sorted(list(undefined)),
         risk_flags=visitor.findings,
         ast_summary=(
             f"Detected {len(visitor.functions)} functions, {len(visitor.classes)} classes, "

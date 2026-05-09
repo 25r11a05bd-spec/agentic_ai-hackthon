@@ -143,7 +143,7 @@ async def generate_repair_strategies(
     Generate 2-3 specific code repair strategies for these findings.
     
     CRITICAL PRIORITIES:
-    1. If there is an 'Application Initialization Failure' or import crash (e.g. missing SECRET_TOKEN), you MUST prioritize fixing the Python code by injecting safe fallbacks like `os.getenv("SECRET_TOKEN", "")`.
+    1. If there is an 'Application Initialization Failure' or import crash (e.g. missing DB_URL, API_SECRET, etc.), you MUST prioritize fixing the Python code by injecting safe fallbacks like `os.getenv("DB_URL", "sqlite:///:memory:")`.
     2. Fix actual Python syntax errors, division by zero, or type errors BEFORE suggesting workflow-level retry optimizations.
     3. Always output the COMPLETE `fixed_code` so the engine can apply it directly.
     
@@ -155,7 +155,13 @@ async def generate_repair_strategies(
     LEARNED PATTERNS (FROM PAST SUCCESSFUL FIXES):
     {memories_text}
     
-    Return a JSON object with a "strategies" key containing an array:
+    Return a JSON object with a "strategies" key containing an array.
+    CRITICAL JSON RULES:
+    - DO NOT use Python-style triple quotes `\"\"\"` inside the JSON.
+    - All string values must be wrapped in standard double quotes `"`.
+    - Any newlines inside `fixed_code` MUST be escaped as `\\n`.
+    
+    Format:
     {{
       "strategies": [
         {{
@@ -164,47 +170,85 @@ async def generate_repair_strategies(
           "rationale": "Why this works",
           "steps": ["Step 1"],
           "safety_score": 0.95,
-          "fixed_code": "The ENTIRE fixed app.py code as a string",
+          "fixed_code": "import os\\nSECRET_TOKEN = os.getenv('SECRET_TOKEN', '')\\n# rest of the code...",
           "explanation": "What was changed"
         }}
       ]
     }}
     """
 
+    models_to_try = [settings.groq_model, "llama-3.1-8b-instant", "llama3-8b-8192"]
+    
+    items = []
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": settings.groq_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "response_format": {"type": "json_object"}
-                }
-            )
-            data = resp.json()
-            if "choices" not in data:
-                print(f"❌ [AI-Repair] Groq Error: {data.get('error', 'Unknown Error')}")
+            for model in models_to_try:
+                try:
+                    resp = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={
+                            "model": model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "response_format": {"type": "json_object"}
+                        }
+                    )
+                    data = resp.json()
+                    
+                    if "choices" not in data:
+                        error_info = data.get('error', {})
+                        if isinstance(error_info, dict) and error_info.get("code") == "rate_limit_exceeded":
+                            print(f"⚠️ [AI-Repair] Rate limit hit for {model}. Falling back to next available model...")
+                            continue
+                            
+                        if isinstance(error_info, dict) and error_info.get("code") == "json_validate_failed":
+                            failed_gen = error_info.get("failed_generation", "")
+                            print(f"⚠️ [AI-Repair] Groq JSON strict mode failed on {model}. Attempting to parse Python-style JSON fallback...")
+                            try:
+                                # Try regex extraction if ast.literal_eval fails
+                                import re
+                                import ast
+                                
+                                # Clean up common AI artifacts
+                                cleaned = failed_gen.strip()
+                                if cleaned.startswith("```json"): cleaned = cleaned[7:]
+                                if cleaned.endswith("```"): cleaned = cleaned[:-3]
+                                
+                                try:
+                                    items = json.loads(cleaned).get("strategies", [])
+                                except:
+                                    # Very aggressive: extract everything between 'fixed_code': '...'
+                                    content = ast.literal_eval(cleaned)
+                                    items = content.get("strategies", [])
+                                    
+                                if items: break
+                            except Exception as e:
+                                print(f"❌ [AI-Repair] Fallback parser failed: {e}")
+                                # Continue to next model instead of returning immediately
+                                continue
+                        else:
+                            print(f"❌ [AI-Repair] Groq Error ({model}): {error_info}")
+                            continue
+                    else:
+                        content = json.loads(data["choices"][0]["message"]["content"])
+                        items = content.get("strategies", [])
+                        break
+                        
+                except Exception as e:
+                    print(f"⚠️ [AI-Repair] Request failed for model {model}: {e}")
+                    continue
+            else:
+                print("❌ [AI-Repair] All Groq models failed or were rate-limited.")
                 return []
-            content = json.loads(data["choices"][0]["message"]["content"])
-            items = content.get("strategies", [])
             
             strategies = []
             for item in items:
-                # Ensure fixed_code is present, fallback to full code if missing
                 if not item.get("fixed_code"):
                     item["fixed_code"] = code
                 strategies.append(RepairStrategy(**item))
             return strategies
     except Exception as e:
-        if 'resp' in locals() and hasattr(resp, 'json'):
-            try:
-                err_data = resp.json()
-                print(f"❌ [AI-Repair] Groq API Error: {err_data.get('error', e)}")
-            except:
-                print(f"❌ [AI-Repair] Error: {e}")
-        else:
-            print(f"❌ [AI-Repair] Error: {e}")
+        print(f"❌ [AI-Repair] Unexpected error: {e}")
         return []
 
 class PlanStep(BaseModel):
@@ -257,25 +301,43 @@ async def generate_plan(task: str, code: str) -> ExecutionPlan:
     }}
     """
 
+    models_to_try = [settings.groq_model, "llama-3.1-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
+    
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "response_format": {"type": "json_object"}
-                }
-            )
-            data = resp.json()
-            if "choices" not in data:
-                print(f"❌ [AI-Planner] Groq Error: {data.get('error', 'Unknown')}")
-                raise ValueError(f"Groq API Error: {data.get('error', 'Unknown')}")
-                
-            raw_content = data["choices"][0]["message"]["content"]
-            print(f"🤖 [AI-Planner] Raw Response: {raw_content[:200]}...")
-            content = json.loads(raw_content)
+            for model_id in models_to_try:
+                try:
+                    resp = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "response_format": {"type": "json_object"}
+                        }
+                    )
+                    data = resp.json()
+                    if "choices" not in data:
+                        error_info = data.get("error", {})
+                        if isinstance(error_info, dict) and error_info.get("code") == "rate_limit_exceeded":
+                            print(f"⚠️ [AI-Planner] Rate limit hit for {model_id}. Falling back...")
+                            continue
+                        print(f"❌ [AI-Planner] Groq Error ({model_id}): {error_info}")
+                        continue
+                        
+                    raw_content = data["choices"][0]["message"]["content"]
+                    print(f"🤖 [AI-Planner] Raw Response ({model_id}): {raw_content[:200]}...")
+                    content = json.loads(raw_content)
+                    break # Success!
+                except Exception as e:
+                    print(f"⚠️ [AI-Planner] Attempt failed for {model_id}: {e}")
+                    continue
+            else:
+                print("❌ [AI-Planner] All models failed. Using heuristic fallback.")
+                return ExecutionPlan(
+                    rationale="Model failure fallback.",
+                    steps=[PlanStep(agent="planner", action="Static scan", expected_outcome="Done")]
+                )
             
             # Use recursive extractor for robustness
             content = _extract_nested_json(content, ["rationale", "steps"]) or content

@@ -44,13 +44,15 @@ export function CreateRunModal({ onClose }: { onClose: () => void }) {
           return;
         }
 
-        onClose();
         // Teleport to the live run details page using the correct data structure
         if (result.data && result.data.id) {
           router.push(`/runs/${result.data.id}`);
         } else {
           router.push('/dashboard'); // Fallback if ID is missing
         }
+        
+        // Let the route transition start before closing the modal
+        setTimeout(() => onClose(), 100);
       } catch (err) {
         setError("Network error. Please ensure the backend is running.");
       }

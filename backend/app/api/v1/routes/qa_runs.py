@@ -48,10 +48,15 @@ async def create_qa_run(
         ],
     )
     
-    # INSTANT FIRE (Bypass everything for the demo)
-    import asyncio
-    print(f"🔥 [API] INSTANT START for {run.id}...")
-    asyncio.create_task(service.process_run(run.id))
+    # DISPATCH: Try Redis Queue first, fallback to BackgroundTasks
+    queue_result = await queue_service.enqueue_run(run.id)
+    if queue_result.dispatched:
+        print(f"📡 [API] Dispatched {run.id} to REDIS queue.")
+        await service.mark_run_dispatched(run.id, queue_result.mode, queue_result.detail)
+    else:
+        print(f"🔥 [API] Redis unavailable, using INSTANT START for {run.id}...")
+        await service.mark_run_dispatched(run.id, queue_result.mode, queue_result.detail)
+        background_tasks.add_task(service.process_run, run.id)
     
     return {"success": True, "data": run.model_dump(mode="json")}
 

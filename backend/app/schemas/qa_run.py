@@ -45,6 +45,7 @@ class PythonAnalysis(BaseModel):
     validators: list[str] = Field(default_factory=list)
     retry_patterns: list[str] = Field(default_factory=list)
     exception_handlers: list[str] = Field(default_factory=list)
+    undefined_symbols: list[str] = Field(default_factory=list)
     risk_flags: list[str] = Field(default_factory=list)
     ast_summary: str = ""
 

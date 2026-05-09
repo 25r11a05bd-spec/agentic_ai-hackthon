@@ -169,7 +169,7 @@ export function RunDetailWorkspace({
   return (
     <div className="detail-grid">
 
-      {/* ── Agent Pipeline Steps ── */}
+      {/* ── Agent Pipeline Steps (Full Width) ── */}
       <section className="panel" style={{ gridColumn: "span 2", marginBottom: 0 }}>
         <div className="section-heading">
           <div>
@@ -228,7 +228,7 @@ export function RunDetailWorkspace({
         </div>
       </section>
 
-      {/* ── Download Result Card ── */}
+      {/* ── Download Result Card (Full Width) ── */}
       {(currentRun.report_markdown || currentRun.report_pdf_path || currentRun.status === "success") && (
         <section className="panel" style={{ gridColumn: "span 2", background: "rgba(77,255,128,0.06)", border: "1px solid rgba(77,255,128,0.2)" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
@@ -262,208 +262,221 @@ export function RunDetailWorkspace({
         </section>
       )}
 
-      <div className="detail-column">
-        <section className="timeline-panel">
-          <div className="section-heading">
-            <div>
-              <div className="eyebrow">Playback</div>
-              <h3>Timeline Replay</h3>
-            </div>
-            <StatusPill status={run.status} />
+      {/* ── Left Column Cards ── */}
+      <section className="timeline-panel">
+        <div className="section-heading">
+          <div>
+            <div className="eyebrow">Playback</div>
+            <h3>Timeline Replay</h3>
           </div>
-          <input
-            type="range"
-            min={0}
-            max={Math.max(events.length - 1, 0)}
-            value={Math.min(activeIndex, Math.max(events.length - 1, 0))}
-            onChange={(event) => setActiveIndex(Number(event.target.value))}
-          />
-          <div className="timeline-list" style={{ marginTop: 18 }}>
-            {events.slice().reverse().map((event) => (
-              <button
-                key={event.id}
-                type="button"
-                className="timeline-item"
-                style={{ color: "inherit", textAlign: "left", cursor: "pointer" }}
-                onClick={() => setActiveIndex(events.findIndex((item) => item.id === event.id))}
-              >
-                <strong>{event.event_type}</strong>
-                <div>{event.step}</div>
-                <small className="muted" suppressHydrationWarning>
-                  {event.agent} · {new Date(event.timestamp).toLocaleTimeString()}
-                </small>
-              </button>
-            ))}
-          </div>
-        </section>
+          <StatusPill status={run.status} />
+        </div>
+        <input
+          type="range"
+          min={0}
+          max={Math.max(events.length - 1, 0)}
+          value={Math.min(activeIndex, Math.max(events.length - 1, 0))}
+          onChange={(event) => setActiveIndex(Number(event.target.value))}
+        />
+        <div className="timeline-list" style={{ marginTop: 18 }}>
+          {events.slice().reverse().map((event) => (
+            <button
+              key={event.id}
+              type="button"
+              className="timeline-item"
+              style={{ color: "inherit", textAlign: "left", cursor: "pointer" }}
+              onClick={() => setActiveIndex(events.findIndex((item) => item.id === event.id))}
+            >
+              <strong>{event.event_type}</strong>
+              <div>{event.step}</div>
+              <small className="muted" suppressHydrationWarning>
+                {event.agent} · {new Date(event.timestamp).toLocaleTimeString()}
+              </small>
+            </button>
+          ))}
+        </div>
+      </section>
 
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <div className="eyebrow">Runtime Topology</div>
-              <h3>Graph Highlight Sync</h3>
-            </div>
+      <section className="panel">
+        <div className="section-heading">
+          <div>
+            <div className="eyebrow">Runtime Topology</div>
+            <h3>Graph Highlight Sync</h3>
           </div>
-          <div style={{ width: "100%", height: 520 }}>
-            <ReactFlow nodes={flowNodes} edges={flowEdges} fitView>
-              <Background color="rgba(132, 197, 255, 0.08)" />
-              <Controls />
-            </ReactFlow>
-          </div>
-        </section>
+        </div>
+        <div style={{ width: "100%", height: 520 }}>
+          <ReactFlow nodes={flowNodes} edges={flowEdges} fitView>
+            <Background color="rgba(132, 197, 255, 0.08)" />
+            <Controls />
+          </ReactFlow>
+        </div>
+      </section>
 
-        <section className="console-panel">
-          <div className="section-heading">
-            <div>
-              <div className="eyebrow">Live Console</div>
-              <h3>Agent Log Stream</h3>
-            </div>
+      <section className="console-panel">
+        <div className="section-heading">
+          <div>
+            <div className="eyebrow">Live Console</div>
+            <h3>Agent Log Stream</h3>
           </div>
-          <ul className="console-stream">
-            {events.map((event) => (
-              <li key={event.id}>
-                <strong>
-                  {event.agent} · {event.event_type}
-                </strong>
-                <span>{event.step}</span>
-                <small className="muted" suppressHydrationWarning>
-                  {event.status} · {new Date(event.timestamp).toLocaleString()}
-                </small>
-              </li>
-            ))}
-          </ul>
-        </section>
-      </div>
+        </div>
+        <ul className="console-stream">
+          {events.map((event) => (
+            <li key={event.id}>
+              <strong>
+                {event.agent} · {event.event_type}
+              </strong>
+              <span>{event.step}</span>
+              <small className="muted" suppressHydrationWarning>
+                {event.status} · {new Date(event.timestamp).toLocaleString()}
+              </small>
+            </li>
+          ))}
+        </ul>
+      </section>
 
-      <div className="detail-column">
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <div className="eyebrow">Failure Explainer</div>
-              <h3>Grounded Evidence</h3>
-            </div>
+      {/* ── Right Column Cards ── */}
+      <section className="panel">
+        <div className="section-heading">
+          <div>
+            <div className="eyebrow">Failure Explainer</div>
+            <h3>Grounded Evidence & Auto-Fixes</h3>
           </div>
-          {failure ? (
-            <div className="finding-list">
-              <div className="finding-item">
-                <strong>Root Cause</strong>
-                <div>{failure.root_cause}</div>
-              </div>
-              <div className="finding-item">
-                <strong>User Impact</strong>
-                <div>{failure.user_impact}</div>
-              </div>
-              <div className="finding-item">
-                <strong>Why Previous Attempt Failed</strong>
-                <div>{failure.why_previous_attempt_failed}</div>
-              </div>
-              <div className="finding-item">
-                <strong>Recommended Fix</strong>
-                <div>{failure.recommended_fix}</div>
-              </div>
-              <div className="finding-item">
-                <strong>Evidence</strong>
-                <div className="timeline-list">
-                  {failure.evidence.map((entry) => (
-                    <div key={entry} className="artifact-item">
-                      {entry}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="muted">No failure explanation was required for this run.</div>
-          )}
-        </section>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <div className="eyebrow">Findings</div>
-              <h3>Validator and Hallucination Flags</h3>
-            </div>
-          </div>
+        </div>
+        {failure ? (
           <div className="finding-list">
-            {run.findings.map((finding) => (
-              <div className="finding-item" key={finding.id}>
-                <strong>{finding.title}</strong>
-                <div>{finding.description}</div>
-                <small className="muted">
-                  {finding.category} · {finding.severity}
-                </small>
-              </div>
-            ))}
-          </div>
-        </section>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <div className="eyebrow">Collaboration</div>
-              <h3>Agent Handoffs</h3>
+            <div className="finding-item">
+              <strong>Root Cause</strong>
+              <div>{failure.root_cause}</div>
             </div>
-          </div>
-          <div className="lane-list">
-            {collaboration.map((step) => (
-              <div className="lane-item" key={step.id}>
-                <strong>{step.agent}</strong>
-                <div>{step.handoff_summary}</div>
-                <small className="muted">
-                  risk {step.risk_level} · confidence {(step.confidence * 100).toFixed(0)}%
-                </small>
-              </div>
-            ))}
-          </div>
-        </section>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <div className="eyebrow">Artifacts</div>
-              <h3>Uploaded Evidence</h3>
+            <div className="finding-item">
+              <strong>User Impact</strong>
+              <div>{failure.user_impact}</div>
             </div>
-          </div>
-          <div className="artifact-list">
-            {run.attachments.length ? (
-              run.attachments.map((artifact) => (
-                <div className="artifact-item" key={artifact.path}>
-                  <strong>{artifact.name}</strong>
-                  <div>{artifact.file_type}</div>
-                </div>
-              ))
-            ) : (
-              <div className="artifact-item">No extra evidence attachments were supplied for this run.</div>
+            <div className="finding-item">
+              <strong>Why Previous Attempt Failed</strong>
+              <div>{failure.why_previous_attempt_failed}</div>
+            </div>
+            <div className="finding-item">
+              <strong>Recommended Fix</strong>
+              <div>{failure.recommended_fix}</div>
+            </div>
+            <div className="finding-item">
+              <strong>Evidence</strong>
+              <div className="timeline-list">
+                {failure.evidence.map((entry) => (
+                  <div key={entry} className="artifact-item">
+                    {entry}
+                  </div>
+                ))}
+              </div>
+            </div>
+            {run.repair_strategies && run.repair_strategies.length > 0 && run.repair_strategies.some(s => s.fixed_code) && (
+              <div className="finding-item" style={{ marginTop: '1rem', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '1rem' }}>
+                <strong>Autonomous Code Patches</strong>
+                {run.repair_strategies.filter(s => s.fixed_code).map(strategy => (
+                  <div key={strategy.id} style={{ marginTop: '0.5rem', padding: '0.5rem', background: 'rgba(0,0,0,0.2)', borderRadius: '4px' }}>
+                    <div style={{ color: '#00d2ff', fontWeight: 600, marginBottom: '0.5rem' }}>{strategy.title}</div>
+                    <pre style={{ whiteSpace: 'pre-wrap', fontSize: '0.8rem', color: '#a0aab5', fontFamily: 'monospace' }}>
+                      {strategy.fixed_code}
+                    </pre>
+                  </div>
+                ))}
+              </div>
             )}
           </div>
-        </section>
-        <section className="panel" style={{ gridColumn: "span 2" }}>
-          <div className="section-heading">
-            <div>
-              <div className="eyebrow">Analysis Result</div>
-              <h3>Executive Analysis Report</h3>
-            </div>
+        ) : (
+          <div className="muted">No failure explanation was required for this run.</div>
+        )}
+      </section>
+
+      <section className="panel">
+        <div className="section-heading">
+          <div>
+            <div className="eyebrow">Findings</div>
+            <h3>Validator and Hallucination Flags</h3>
           </div>
-          {run.report_markdown ? (
-            <div
-              className="console-stream"
-              style={{
-                maxHeight: "none",
-                background: "rgba(12, 31, 47, 0.4)",
-                padding: "20px",
-                whiteSpace: "pre-wrap",
-                fontFamily: "Inter, sans-serif",
-                lineHeight: "1.6",
-                color: "#edf5ff"
-              }}
-            >
-              {run.report_markdown}
+        </div>
+        <div className="finding-list">
+          {run.findings.map((finding) => (
+            <div className="finding-item" key={finding.id}>
+              <strong>{finding.title}</strong>
+              <div>{finding.description}</div>
+              <small className="muted">
+                {finding.category} · {finding.severity}
+              </small>
             </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="section-heading">
+          <div>
+            <div className="eyebrow">Collaboration</div>
+            <h3>Agent Handoffs</h3>
+          </div>
+        </div>
+        <div className="lane-list">
+          {collaboration.map((step) => (
+            <div className="lane-item" key={step.id}>
+              <strong>{step.agent}</strong>
+              <div>{step.handoff_summary}</div>
+              <small className="muted">
+                risk {step.risk_level} · confidence {(step.confidence * 100).toFixed(0)}%
+              </small>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="section-heading">
+          <div>
+            <div className="eyebrow">Artifacts</div>
+            <h3>Uploaded Evidence</h3>
+          </div>
+        </div>
+        <div className="artifact-list">
+          {run.attachments.length ? (
+            run.attachments.map((artifact) => (
+              <div className="artifact-item" key={artifact.path}>
+                <strong>{artifact.name}</strong>
+                <div>{artifact.file_type}</div>
+              </div>
+            ))
           ) : (
-            <div className="muted">The report is being generated by the AI agent fleet...</div>
+            <div className="artifact-item">No extra evidence attachments were supplied for this run.</div>
           )}
-        </section>
-      </div>
+        </div>
+      </section>
+
+      {/* ── Executive Report (Full Width) ── */}
+      <section className="panel" style={{ gridColumn: "span 2" }}>
+        <div className="section-heading">
+          <div>
+            <div className="eyebrow">Analysis Result</div>
+            <h3>Executive Analysis Report</h3>
+          </div>
+        </div>
+        {currentRun.report_markdown ? (
+          <div
+            className="console-stream"
+            style={{
+              maxHeight: "none",
+              background: "rgba(12, 31, 47, 0.4)",
+              padding: "20px",
+              whiteSpace: "pre-wrap",
+              fontFamily: "Inter, sans-serif",
+              lineHeight: "1.6",
+              color: "#edf5ff"
+            }}
+          >
+            {currentRun.report_markdown}
+          </div>
+        ) : (
+          <div className="muted">The report is being generated by the AI agent fleet...</div>
+        )}
+      </section>
     </div>
   );
 }
